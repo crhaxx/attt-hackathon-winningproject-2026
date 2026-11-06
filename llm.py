@@ -109,13 +109,24 @@ def _send(raw: str) -> dict:
 
 def chat_json(system: str, user: str | list, model: str, max_tokens: int = 4000) -> dict:
     """Ask for a JSON object and parse it (tolerates ```json fences)."""
-    msg = chat([{"role": "system", "content": system}, {"role": "user", "content": user}],
-               model, json_mode=True, max_tokens=max_tokens)
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    msg = chat(messages, model, json_mode=True, max_tokens=max_tokens)
     text = msg.get("content") or ""
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
         raise LLMError(f"model returned no JSON: {text[:200]}")
-    return json.loads(m.group(0))
+    out = json.loads(m.group(0))
+    if not isinstance(out, dict):
+        raise LLMError(f"model returned a non-object JSON answer: {text[:200]}")
+    return out
+
+
+def forget_json(system: str, user: str | list, model: str, max_tokens: int = 4000):
+    """Drop the cached answer of a chat_json request. Callers use it when a request finally failed,
+    so the unusable answer is asked again next run instead of being replayed from the cache forever."""
+    body = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "max_tokens": max_tokens, "temperature": 0, "response_format": {"type": "json_object"}}
+    (CACHE / f"{hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()}.json").unlink(missing_ok=True)
 
 
 def image_part(path: Path, data: bytes | None = None) -> dict:

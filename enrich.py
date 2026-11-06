@@ -121,18 +121,63 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:60] or "untitled"
 
 
-def _extract_one(src, catalog: str):
+def _extract_call(src, catalog: str):
     user = (f"Known components:\n{catalog}\n\nDocument path: {src.path}\nKind: {src.kind}\n"
             f"<document>\n{src.text[:60000]}\n</document>")
-    try:
-        return src, llm.chat_json(EXTRACT_SYSTEM, user, llm.EXTRACT_MODEL, max_tokens=4000), None
-    except json.JSONDecodeError:
-        try:  # usually a truncated answer on a long document: retry with more room
-            return src, llm.chat_json(EXTRACT_SYSTEM, user, llm.EXTRACT_MODEL, max_tokens=12000), None
-        except (llm.LLMError, json.JSONDecodeError) as e:
-            return src, None, str(e)
-    except llm.LLMError as e:
-        return src, None, str(e)
+    out, err = _ask_json(EXTRACT_SYSTEM, user, llm.EXTRACT_MODEL)
+    return src, out, err
+
+
+def _extract_one(src, catalog: str):
+    fut = _PREFETCH.pop(("prose", src.path, catalog), None)
+    return fut.result() if fut else _extract_call(src, catalog)
+
+
+# --------------------------------------------------------------------------- scheduling
+
+# Requests started early (prefetch) so they overlap with the code pass. Keyed by kind, path and the exact
+# catalog in the prompt: a prefetched answer is only used for the identical request, so results never change.
+_PREFETCH: dict = {}
+_PREFETCH_POOL = None
+
+
+def _ordered(workers: int, fn, items, size):
+    """Run fn over items in a thread pool, longest jobs first (so the slowest call does not start last),
+    yielding results in the ORIGINAL order, so storage order and therefore results stay identical."""
+    items = list(items)
+    if not items:
+        return
+    with ThreadPoolExecutor(max(workers, 1)) as pool:
+        futs = {}
+        for i in sorted(range(len(items)), key=lambda i: size(items[i]), reverse=True):
+            futs[i] = pool.submit(fn, items[i])
+        for i in range(len(items)):
+            yield futs[i].result()
+
+
+def prefetch(ctx, catalog: str, docs, diagrams, workers: int):
+    """Start the prose and diagram requests in the background (longest first). They depend only on the
+    file and the catalog, so they can run while the code pass is still going. Answers land in the response
+    cache and are picked up by extract_prose / read_diagrams for the identical request."""
+    global _PREFETCH_POOL
+    jobs = [("prose", s) for s in docs] + [("diagram", s) for s in diagrams]
+    if not jobs or not llm.available():
+        return
+    _PREFETCH_POOL = ThreadPoolExecutor(max(workers, 1))
+    for kind, s in sorted(jobs, key=lambda j: len(j[1].text or "") if j[0] == "prose" else j[1].size, reverse=True):
+        fn = (lambda s=s: _extract_call(s, catalog)) if kind == "prose" else (lambda s=s: _diagram_call(ctx, s, catalog))
+        _PREFETCH[(kind, s.path, catalog)] = _PREFETCH_POOL.submit(fn)
+
+
+def end_prefetch():
+    """Drop prefetched requests that were not used (e.g. the catalog changed) and release the pool."""
+    global _PREFETCH_POOL
+    for fut in _PREFETCH.values():
+        fut.cancel()
+    _PREFETCH.clear()
+    if _PREFETCH_POOL:
+        _PREFETCH_POOL.shutdown(wait=False, cancel_futures=True)
+        _PREFETCH_POOL = None
 
 
 def prose_sources(ctx):
@@ -147,21 +192,20 @@ def extract_prose(ctx, catalog: str, workers: int, docs) -> tuple[list[str], lis
     model = f"llm:{llm.EXTRACT_MODEL}"
     kept = dropped = 0
     ok, failed = [], []
-    with ThreadPoolExecutor(max(workers, 1)) as pool:
-        for src, out, err in pool.map(lambda s: _extract_one(s, catalog), docs):
-            if not err:
-                st.use(f"llm:{src.path}")
-                try:
-                    k, d = _store_prose(ctx, src, out, model)
-                    kept, dropped = kept + k, dropped + d
-                    ok.append(src.path)
-                    continue
-                except MALFORMED as e:  # malformed model output
-                    err = f"unusable model output: {e}"
-                finally:
-                    ctx.doc_aliases = {}  # aliases are local to the document's own unit
-            failed.append(src.path)
-            print(f"  ! {src.path}: {err[:120]}")
+    for src, out, err in _ordered(workers, lambda s: _extract_one(s, catalog), docs, lambda s: len(s.text or "")):
+        if not err:
+            st.use(f"llm:{src.path}")
+            try:
+                k, d = _store_prose(ctx, src, out, model)
+                kept, dropped = kept + k, dropped + d
+                ok.append(src.path)
+                continue
+            except MALFORMED as e:  # malformed model output
+                err = f"unusable model output: {e}"
+            finally:
+                ctx.doc_aliases = {}  # aliases are local to the document's own unit
+        failed.append(src.path)
+        print(f"  ! {src.path}: {err[:120]}")
     n_dec = st.db.execute("SELECT COUNT(*) FROM component WHERE kind IN ('decision','policy','constraint')").fetchone()[0]
     print(f"  prose: {len(docs)} docs, {kept} items kept ({n_dec} decisions/policies in the graph), "
           f"{dropped} dropped (quote not found), {len(failed)} failed")
@@ -320,32 +364,34 @@ def diagram_sources(ctx):
     return [s for s in ctx.sources.values() if s.kind == "diagram"]
 
 
+def _diagram_call(ctx, src, catalog: str):
+    user = [{"type": "text", "text": f"Known components:\n{catalog}\n\nFile: {src.path}"},
+            llm.image_part(Path(src.path), ctx.read_blob(src.path))]
+    out, err = _ask_json(DIAGRAM_SYSTEM, user, llm.REASON_MODEL, max_tokens=3000, retry_tokens=None)
+    return src, out, err
+
+
+def _diagram_one(ctx, src, catalog: str):
+    fut = _PREFETCH.pop(("diagram", src.path, catalog), None)
+    return fut.result() if fut else _diagram_call(ctx, src, catalog)
+
+
 def read_diagrams(ctx, catalog: str, workers: int, diagrams) -> tuple[list[str], list[str]]:
     """Vision extraction for the given diagrams (bytes come from the Git blob); returns (succeeded, failed)."""
     st = ctx.store
-
-    def one(src):
-        user = [{"type": "text", "text": f"Known components:\n{catalog}\n\nFile: {src.path}"},
-                llm.image_part(Path(src.path), ctx.read_blob(src.path))]
-        try:
-            return src, llm.chat_json(DIAGRAM_SYSTEM, user, llm.REASON_MODEL, max_tokens=3000), None
-        except (llm.LLMError, json.JSONDecodeError) as e:
-            return src, None, str(e)
-
     model = f"llm:{llm.REASON_MODEL}"
     ok, failed = [], []
-    with ThreadPoolExecutor(max(workers, 1)) as pool:
-        for src, out, err in pool.map(one, diagrams):
-            if not err:
-                st.use(f"llm:{src.path}")
-                try:
-                    _store_diagram(ctx, src, out, model)
-                    ok.append(src.path)
-                    continue
-                except MALFORMED as e:
-                    err = f"unusable model output: {e}"
-            failed.append(src.path)
-            print(f"  ! {src.path}: {err[:120]}")
+    for src, out, err in _ordered(workers, lambda s: _diagram_one(ctx, s, catalog), diagrams, lambda s: s.size):
+        if not err:
+            st.use(f"llm:{src.path}")
+            try:
+                _store_diagram(ctx, src, out, model)
+                ok.append(src.path)
+                continue
+            except MALFORMED as e:
+                err = f"unusable model output: {e}"
+        failed.append(src.path)
+        print(f"  ! {src.path}: {err[:120]}")
     print(f"  diagrams: {len(diagrams)} read, {len(failed)} failed")
     return ok, failed
 
@@ -480,15 +526,12 @@ def verify(ctx, workers: int) -> int:
         jobs.append((cid, "\n".join(lines), ids, cand_ids))
 
     def one(job):
-        cid, text, ids, cand_ids = job
-        try:
-            return job, llm.chat_json(VERIFY_SYSTEM, text, llm.REASON_MODEL, max_tokens=4000), None
-        except (llm.LLMError, json.JSONDecodeError) as e:
-            return job, None, str(e)
+        out, err = _ask_json(VERIFY_SYSTEM, job[1], llm.REASON_MODEL, retry_tokens=None)
+        return job, out, err
 
     confirmed = rejected = new = failed = 0
-    with ThreadPoolExecutor(max(workers, 1)) as pool:
-        for (cid, _, ids, cand_ids), out, err in pool.map(one, jobs):
+    if True:  # (indentation kept from the former pool block)
+        for (cid, _, ids, cand_ids), out, err in _ordered(workers, one, jobs, lambda j: len(j[1])):
             if err:
                 failed += 1
                 print(f"  ! verify {cid}: {err[:120]}")
@@ -545,22 +588,37 @@ CODE_EXT_LLM = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".java", ".
                 ".php", ".cs", ".scala", ".ex", ".exs", ".dart", ".vue", ".svelte", ".swift"}
 
 
-def _ask_json(system, user, model):
+def _ask_json(system, user, model, max_tokens: int = 4000, retry_tokens: int | None = 12000):
+    """chat_json with one larger retry on broken JSON. On a final failure the cached answers are
+    forgotten, so the next run asks again instead of replaying an unusable answer forever."""
     try:
-        return llm.chat_json(system, user, model, max_tokens=4000), None
-    except json.JSONDecodeError:
-        try:  # usually a truncated answer: retry with more room
-            return llm.chat_json(system, user, model, max_tokens=12000), None
-        except (llm.LLMError, json.JSONDecodeError) as e:
-            return None, str(e)
-    except llm.LLMError as e:
+        return llm.chat_json(system, user, model, max_tokens=max_tokens), None
+    except json.JSONDecodeError as e:
+        if retry_tokens:
+            try:  # usually a truncated answer: retry with more room
+                return llm.chat_json(system, user, model, max_tokens=retry_tokens), None
+            except (llm.LLMError, json.JSONDecodeError) as e2:
+                llm.forget_json(system, user, model, retry_tokens)
+                e = e2
+        llm.forget_json(system, user, model, max_tokens)
         return None, str(e)
+    except llm.LLMError as e:
+        llm.forget_json(system, user, model, max_tokens)
+        return None, str(e)
+
+
+# Build/lint/test tool configuration: never an integration surface or a security finding (measured: no
+# relation, risk or conflict ever came from these on the target repo). The rule-based scan still reads them.
+TOOL_CONFIG = re.compile(r"^(eslint\.config|vite\.config|vitest\.config|next\.config|jest\.config|jest-preset|"
+                         r"webpack\.config|rollup\.config|babel\.config|postcss\.config|tailwind\.config|"
+                         r"prettier\.config|svelte\.config|astro\.config|metro\.config|tsup\.config|tsdown\.config)"
+                         r"\.[cm]?[jt]s$|-env\.d\.ts$")
 
 
 def code_sources(ctx):
     return [s for s in ctx.sources.values()
             if s.kind == "code" and s.text and 40 < len(s.text) < 120_000 and ctx.owner(s.path)
-            and "." + s.name.rsplit(".", 1)[-1].lower() in CODE_EXT_LLM]
+            and "." + s.name.rsplit(".", 1)[-1].lower() in CODE_EXT_LLM and not TOOL_CONFIG.search(s.name.lower())]
 
 
 def code_pass(ctx, workers: int, files) -> tuple[list[str], list[str]]:
@@ -574,19 +632,18 @@ def code_pass(ctx, workers: int, files) -> tuple[list[str], list[str]]:
 
     counts = {"routes": 0, "calls": 0, "sql": 0, "events": 0, "risks": 0, "dropped": 0, "unresolved": 0}
     ok, failed = [], []
-    with ThreadPoolExecutor(max(workers, 1)) as pool:
-        for src, out, err in pool.map(one, files):
-            if not err:
-                ctx.store.use(f"llm:code:{src.path}")
-                ctx.seed_seen(f"det:{src.path}")
-                try:
-                    _store_code(ctx, src, out, model, counts)
-                    ok.append(src.path)
-                    continue
-                except MALFORMED as e:
-                    err = f"unusable model output: {e}"
-            failed.append(src.path)
-            print(f"  ! {src.path}: {err[:120]}")
+    for src, out, err in _ordered(workers, one, files, lambda s: len(s.text or "")):
+        if not err:
+            ctx.store.use(f"llm:code:{src.path}")
+            ctx.seed_seen(f"det:{src.path}")
+            try:
+                _store_code(ctx, src, out, model, counts)
+                ok.append(src.path)
+                continue
+            except MALFORMED as e:
+                err = f"unusable model output: {e}"
+        failed.append(src.path)
+        print(f"  ! {src.path}: {err[:120]}")
     print(f"  code: {len(files)} files -> " + ", ".join(f"{k} {v}" for k, v in counts.items())
           + f", {len(failed)} failed")
     return ok, failed
@@ -653,11 +710,13 @@ def _store_code(ctx, src, out, model, counts):
 # --------------------------------------------------------------------------- entry
 
 def catalog_text(ctx) -> str:
-    # only components the rules or the code pass declare: prose/diagram output must not keep a
-    # removed component alive (it would otherwise stay in its own prompt's catalog)
+    # only components the rules declare: prose/diagram output must not keep a removed component alive
+    # (it would otherwise stay in its own prompt's catalog), and the code pass's model output must not
+    # change the catalog (every prose and diagram prompt contains it). It also makes the catalog known
+    # before the code pass, so prose/diagram requests can start while the code pass runs.
     rows = ctx.store.db.execute(
         "SELECT id, path FROM component WHERE (id LIKE 'comp:%' OR kind IN ('table','team')) AND id IN "
-        "(SELECT id FROM component_decl WHERE unit LIKE 'det:%' OR unit LIKE 'llm:code:%') ORDER BY id")
+        "(SELECT id FROM component_decl WHERE unit LIKE 'det:%') ORDER BY id")
     return "\n".join(f"- {cid}" + (f" ({p})" if p else "") for cid, p in rows)
 
 

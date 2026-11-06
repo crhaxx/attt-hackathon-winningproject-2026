@@ -2784,6 +2784,12 @@ class Ingestion:
             # A. code pass (any language): its endpoints/calls feed the cross-source checks
             pending = self.model_pending()
             todo = {u: v for u, v in self.model_units().items() if u in pending and v[1] == "code"}
+            # Prose/diagram requests depend only on their file and the catalog (rule declarations only),
+            # so they start now and overlap with the code pass. B picks up the answers for the identical
+            # requests; storage order is unchanged, so results are the same as running them afterwards.
+            early = {u: v for u, v in self.model_units().items() if u in pending and v[1] != "code"}
+            enrich.prefetch(ctx, enrich.catalog_text(ctx), [s for s, k in early.values() if k == "prose"],
+                            [s for s, k in early.values() if k == "diagram"], workers)
             st.step = CODE_PASS_STEP
             ok, failed = enrich.code_pass(ctx, workers, [s for s, _ in todo.values()])
             st.finish()
@@ -2813,6 +2819,7 @@ class Ingestion:
             catalog = enrich.catalog_text(ctx)
             ok, failed = enrich.extract_prose(ctx, catalog, workers, [s for s, k in todo.values() if k == "prose"])
             ok2, failed2 = enrich.read_diagrams(ctx, catalog, workers, [s for s, k in todo.values() if k == "diagram"])
+            enrich.end_prefetch()  # anything prefetched for a different catalog is simply not used
             st.finish()
             for path in ok + ok2:
                 s, kind = todo[f"llm:{path}"]
@@ -2967,7 +2974,7 @@ def parse_args(argv=None):
     ap.add_argument("--repo", type=Path, help="existing local checkout (read-only, must have no tracked changes)")
     ap.add_argument("--db", type=Path, default=HERE / "context.db")
     ap.add_argument("--no-llm", action="store_true", help="skip the OpenRouter stages")
-    ap.add_argument("--workers", type=int, default=8, help="parallel LLM requests")
+    ap.add_argument("--workers", type=int, default=16, help="parallel LLM requests per stage")
     ap.add_argument("--show-unresolved", action="store_true", help="list call targets no component matched")
     ap.add_argument("--label", help="name of the source for run-to-run comparison (default: repo url/path)")
     ap.add_argument("--stats", action="store_true", help="also print per-kind/check/rule breakdowns")
