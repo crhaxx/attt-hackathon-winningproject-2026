@@ -48,6 +48,11 @@ python3 ingest.py                               # clone the source repo and buil
 python3 ask.py "Where do the docs contradict the code?"
 ```
 
+Re-running `ingest.py` after new commits updates `context.db` in place: only files whose Git blob
+changed are re-extracted, cross-source checks are recomputed, and an unchanged snapshot is a
+no-op. `--no-llm` builds the rules-only stage; a later normal run adds only the missing AI work.
+See [Keeping context.db up to date](WORKFLOW.md#keeping-contextdb-up-to-date).
+
 On NixOS: `nix-shell -p python3 python3Packages.pyyaml git --run 'python3 ingest.py'`
 
 ### Configuration
@@ -148,6 +153,7 @@ The knowledge base is a single SQLite file. You can browse it with
 | `conflict` | conflicts / gaps / stale docs, with verifier verdict and rationale |
 | `risk` | security concern, severity, guidance for generated code |
 | `run`, `change` | ingest history and the new / resolved findings per run |
+| `stage_state`, `extraction_unit` | source commit, blob ids, signatures and stage completion (provenance) |
 
 ---
 
@@ -160,6 +166,9 @@ The knowledge base is a single SQLite file. You can browse it with
 | `llm.py` | OpenRouter client with retries and an on-disk response cache |
 | `query.py` | Deterministic queries over `context.db` |
 | `ask.py` | Natural-language agent over the query tools, with citation checking |
+| `gitsnap.py` | Read-only Git access: identity, blob ids, diffs, clean-checkout check |
+| `mcp/server.py` | Read-only MCP server over the query tools (`.cursor/mcp.json`) |
+| `tests/` | Incremental-ingest tests on temporary Git repositories (mocked model, no API calls) |
 | `WORKFLOW.md` | Detailed walkthrough of every step, design decisions and limits |
 
 ## Limits and next steps
@@ -168,9 +177,9 @@ The knowledge base is a single SQLite file. You can browse it with
   - Migration replay only understands SQLite-compatible SQL.
   - gRPC `.proto` files are indexed but not yet parsed into endpoints.
   - Calls through variables with no address evidence stay unresolved (by design).
+  - Incremental ingest re-runs more than strictly needed when shared context changes (see WORKFLOW).
 - **Next steps:**
-  - An MCP server, so IDEs can call `ask`, `impact` and the other tools directly.
-  - Stable evidence ids and incremental per-file re-ingest on every commit.
+  - Run `ingest.py` from CI or a post-merge hook, so the database follows the default branch.
   - Multiple repositories in one knowledge base, for cross-repo relationships.
 
 See **[WORKFLOW.md](WORKFLOW.md)** for the full explanation.

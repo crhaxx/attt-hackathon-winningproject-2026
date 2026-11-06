@@ -31,6 +31,8 @@ def connect() -> sqlite3.Connection:
         sys.exit("context.db not found - run: python3 ingest.py")
     db = sqlite3.connect(DB)
     db.row_factory = sqlite3.Row
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name = 'source'").fetchone():
+        sys.exit("context.db is not initialised - run: python3 ingest.py")
     return db
 
 

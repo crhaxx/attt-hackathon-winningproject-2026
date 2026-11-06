@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Context Service - ingest pipeline.
+"""Context Service - ingest pipeline (incremental, Git-driven).
 
-Turns any engineering repository into one SQLite knowledge base (context.db).
-Nothing here depends on a particular repository's folder names or conventions:
+Turns any engineering repository into one SQLite knowledge base (context.db) and keeps it
+up to date commit by commit. Nothing here depends on a particular repository's folder names
+or conventions:
 
   * components are discovered from standard manifests (package.json, pyproject.toml,
     go.mod, pom.xml, Cargo.toml, ...) wherever they are in the tree
@@ -17,10 +18,15 @@ Nothing here depends on a particular repository's folder names or conventions:
 Every fact carries evidence (file, line, quote), its extractor, a status
 (observed / declared / outdated) and a confidence. The source repo is never modified.
 
+Provenance: the database records the repository identity, the commit it represents, the
+Git blob id of every stored file, the extraction signature and the completion state of the
+deterministic and model stages. A re-run only re-extracts files whose blob (or whose shared
+extraction context) changed; cross-source checks are recomputed when any input changed.
+
 Usage:
-    python3 ingest.py                        # clone/update the default repo
+    python3 ingest.py                        # clone/update the default repo, update context.db
     python3 ingest.py --repo-url <git url>   # any other repository
-    python3 ingest.py --repo /path/checkout  # an existing local checkout (read-only)
+    python3 ingest.py --repo /path/checkout  # an existing local checkout (read-only, clean)
     python3 ingest.py --no-llm               # deterministic stage only
 """
 from __future__ import annotations
@@ -33,6 +39,9 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
+from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -42,8 +51,17 @@ try:
 except ImportError:  # pragma: no cover
     yaml = None
 
+import enrich
+import gitsnap
+import llm
+
 DEFAULT_REPO_URL = "https://github.com/arkik7/att-hackathon-task"
 HERE = Path(__file__).resolve().parent
+
+# Bump when extractor, check, rule or classification code changes: every deterministic
+# result is then re-extracted (and model results re-checked) even if HEAD did not move.
+EXTRACTION_VERSION = "2026-11-06.2"
+SCHEMA_VERSION = 2
 
 # --------------------------------------------------------------------------
 # Ontology / storage
@@ -99,26 +117,6 @@ CREATE TABLE conflict (
     rationale TEXT,
     fingerprint TEXT             -- stable identity across runs (type + subject + evidence file/quote)
 );
-CREATE TABLE run (               -- one row per ingest; history is carried over between rebuilds
-    id INTEGER PRIMARY KEY,
-    repo TEXT,
-    commit_sha TEXT,
-    finished TEXT,
-    llm INTEGER,
-    conflicts INTEGER,
-    risks INTEGER,
-    new INTEGER,
-    resolved INTEGER,
-    baseline_run INTEGER         -- run this one was compared with (NULL = no comparable baseline)
-);
-CREATE TABLE change (            -- what appeared / disappeared compared with the baseline run
-    run_id INTEGER NOT NULL,
-    item TEXT NOT NULL,          -- conflict | risk
-    change TEXT NOT NULL,        -- new | resolved
-    fingerprint TEXT NOT NULL,
-    summary TEXT NOT NULL,
-    ref_id INTEGER               -- conflict/risk id in this run's tables (NULL when resolved)
-);
 CREATE TABLE claim (             -- stage 2: what a document asserts about a component
     id INTEGER PRIMARY KEY,
     component TEXT NOT NULL,
@@ -144,7 +142,188 @@ CREATE INDEX relation_src ON relation(src);
 CREATE INDEX relation_dst ON relation(dst);
 """
 
+RUN_SCHEMA = """
+CREATE TABLE run (               -- one row per ingest that changed the database
+    id INTEGER PRIMARY KEY,
+    repo TEXT,
+    commit_sha TEXT,
+    finished TEXT,
+    llm INTEGER,                 -- 1 if the model stage was complete after the run
+    conflicts INTEGER,
+    risks INTEGER,
+    new INTEGER,
+    resolved INTEGER,
+    baseline_run INTEGER         -- run this one was compared with (NULL = no comparable baseline)
+);
+CREATE TABLE change (            -- what appeared / disappeared compared with the baseline run
+    run_id INTEGER NOT NULL,
+    item TEXT NOT NULL,          -- conflict | risk
+    change TEXT NOT NULL,        -- new | resolved
+    fingerprint TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    ref_id INTEGER               -- conflict/risk id in this run's tables (NULL when resolved)
+);
+"""
+
+# Schema v2 (provenance + incremental units). Applied on top of SCHEMA for new databases and
+# as the migration of unversioned databases, so both end up identical.
+MIGRATION_V2 = """
+ALTER TABLE source ADD COLUMN blob TEXT;          -- Git blob id the row was read from
+ALTER TABLE source ADD COLUMN det_kind TEXT;      -- rule-based classification (kind may be refined by the LLM)
+ALTER TABLE evidence ADD COLUMN unit TEXT;        -- extraction unit that produced the row
+ALTER TABLE relation ADD COLUMN unit TEXT;
+ALTER TABLE conflict ADD COLUMN unit TEXT;
+ALTER TABLE conflict ADD COLUMN base_confidence REAL;  -- confidence before verification
+ALTER TABLE claim ADD COLUMN unit TEXT;
+ALTER TABLE risk ADD COLUMN unit TEXT;
+CREATE INDEX evidence_unit ON evidence(unit);
+CREATE INDEX relation_unit ON relation(unit);
+CREATE INDEX conflict_unit ON conflict(unit);
+CREATE INDEX claim_unit ON claim(unit);
+CREATE INDEX risk_unit ON risk(unit);
+CREATE TABLE extraction_unit (   -- what each unit's stored results were derived from
+    unit TEXT PRIMARY KEY,       -- det:<path> | det:* | llm:code:<path> | llm:<path> | llm:diagram-check | llm:verify
+    stage TEXT NOT NULL,         -- deterministic | model
+    path TEXT,                   -- source file of a file-local unit
+    blob TEXT,                   -- Git blob id it was extracted from
+    signature TEXT NOT NULL,     -- extraction version / model + prompt configuration
+    context TEXT,                -- digest of the shared context it depends on (names, ports, catalog)
+    status TEXT NOT NULL,        -- complete | partial
+    commit_id TEXT NOT NULL      -- snapshot at which it was (re)extracted
+);
+CREATE TABLE unit_fact (         -- in-memory extraction context a unit contributes (endpoints, calls,
+    unit TEXT NOT NULL,          -- internal deps, diagram edges), so cross-source checks run without
+    kind TEXT NOT NULL,          -- re-extracting unchanged files
+    data TEXT NOT NULL
+);
+CREATE INDEX unit_fact_unit ON unit_fact(unit);
+CREATE TABLE component_decl (    -- which units declare a component; component = best declaration
+    unit TEXT NOT NULL,
+    id TEXT NOT NULL,
+    rank INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    path TEXT,
+    props TEXT,
+    PRIMARY KEY (unit, id)
+);
+CREATE TABLE ingest_meta (key TEXT PRIMARY KEY, value TEXT);  -- repository identity
+CREATE TABLE stage_state (       -- active snapshot per pipeline stage
+    stage TEXT PRIMARY KEY,      -- deterministic | model
+    commit_id TEXT,
+    signature TEXT,
+    status TEXT NOT NULL,        -- complete | incomplete
+    detail TEXT,
+    updated_at TEXT
+);
+"""
+
 FTS_SCHEMA = "CREATE VIRTUAL TABLE source_fts USING fts5(path, kind, text)"
+
+DERIVED = "det:*"                    # cross-source deterministic results
+DIAGRAM_CHECK = "llm:diagram-check"  # diagram-vs-code comparison (deterministic, on model output)
+VERIFY = "llm:verify"                # model verification verdicts and contradictions
+CODE_UNIT = "llm:code:"              # prefix of per-file LLM code-pass units
+
+# natural keys used to recognise an unchanged record when a unit is re-extracted
+KEYS = {
+    "evidence": ("path", "line", "quote", "extractor"),
+    "relation": ("src", "type", "dst", "status", "confidence", "evidence_id", "props"),
+    "conflict": ("kind", "check_name", "subject", "description", "base_confidence", "evidence_ids"),
+    "claim": ("component", "topic", "text", "path", "doc_date", "doc_status", "evidence_id"),
+    "risk": ("rule", "severity", "subject", "description", "guidance", "confidence", "evidence_id"),
+}
+RECORD_TABLES = ("relation", "claim", "risk", "conflict", "evidence")  # delete order
+
+
+class IngestError(RuntimeError):
+    """User-facing error: printed without a traceback."""
+
+
+def digest(obj) -> str:
+    """Short fingerprint of a JSON-able configuration/context value (not used for file contents)."""
+    return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()[:20]
+
+
+def unit_group(unit: str) -> str:
+    return "derived" if unit == DERIVED else "file" if unit.startswith("det:") else "model"
+
+
+def _statements(script: str):
+    # executescript() would COMMIT the open transaction, so DDL runs statement by statement
+    for stmt in re.sub(r"--[^\n]*", "", script).split(";"):
+        if stmt.strip():
+            yield stmt
+
+
+def _tables(db) -> set[str]:
+    return {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+
+
+def _columns(db, table: str) -> set[str]:
+    return {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+
+
+def schema_state(db: sqlite3.Connection) -> str:
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    tables = _tables(db)
+    if version == SCHEMA_VERSION:
+        return "current"
+    if version > SCHEMA_VERSION:
+        raise IngestError(f"database schema v{version} is newer than this ingest.py (v{SCHEMA_VERSION})")
+    if version == 0 and not tables:
+        return "empty"
+    if version == 0 and {"source", "component", "relation", "evidence"} <= tables:
+        return "legacy"
+    raise IngestError("database is not a Context Service database (unknown tables); use another --db")
+
+
+def create_schema(db: sqlite3.Connection):
+    for stmt in _statements(SCHEMA + RUN_SCHEMA):
+        db.execute(stmt)
+    _upgrade_v2(db)
+
+
+def migrate_legacy(db: sqlite3.Connection):
+    """Unversioned (rebuild-per-run) database -> v2. Its rows carry no unit/blob, so they are
+    removed and the caller performs a one-time full logical refresh inside the same transaction.
+    Ingest history (run/change), when present, is kept."""
+    _upgrade_v2(db)
+    for table in RECORD_TABLES + ("component",):
+        db.execute(f"DELETE FROM {table}")
+    db.execute("DELETE FROM source")
+    if "source_fts" in _tables(db):
+        db.execute("DELETE FROM source_fts")
+
+
+def _upgrade_v2(db: sqlite3.Connection):
+    # both unversioned shapes: the original one, and the one with fingerprints + run history
+    for table in ("conflict", "risk"):
+        if "fingerprint" not in _columns(db, table):
+            db.execute(f"ALTER TABLE {table} ADD COLUMN fingerprint TEXT")
+    if "run" not in _tables(db):
+        for stmt in _statements(RUN_SCHEMA):
+            db.execute(stmt)
+    for stmt in _statements(MIGRATION_V2):
+        db.execute(stmt)
+    if "source_fts" not in _tables(db):
+        try:
+            db.execute(FTS_SCHEMA)
+        except sqlite3.OperationalError:
+            pass  # no FTS5 in this SQLite build: query.py falls back to LIKE
+    db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+@contextmanager
+def transaction(db: sqlite3.Connection):
+    """One atomic publication: readers see the previous or the new state, never a mix."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
+    db.execute("COMMIT")
 
 
 # --------------------------------------------------------------------------
@@ -172,111 +351,237 @@ def active_findings(db) -> dict[str, tuple[str, str, int]]:
     return out
 
 
-def load_previous(db_path: Path) -> dict | None:
-    if not db_path.exists():
-        return None
-    try:
-        old = sqlite3.connect(db_path)
-        runs = old.execute("SELECT * FROM run ORDER BY id").fetchall()
-        changes = old.execute("SELECT * FROM change").fetchall()
-        findings = active_findings(old)
-        old.close()
-    except sqlite3.Error:
-        return None  # database from before run tracking existed: no baseline
-    return {"runs": runs, "changes": changes, "findings": findings, "last": runs[-1] if runs else None}
-
-
-def fingerprint_findings(store: "Store"):
-    db = store.db
+def fingerprint_findings(db):
+    """(Re)compute fingerprints; only rows whose fingerprint is missing or different are written."""
     ev = {i: (p, _quote_key(q)) for i, p, q in db.execute("SELECT id, path, quote FROM evidence")}
-    for cid, kind, check, subject, evs in db.execute(
-            "SELECT id, kind, check_name, subject, evidence_ids FROM conflict").fetchall():
-        keys = sorted(ev[e] for e in json.loads(evs) if e in ev)
-        db.execute("UPDATE conflict SET fingerprint = ? WHERE id = ?", (_fp("conflict", kind, check, subject, keys), cid))
-    for rid, rule, subject, e in db.execute("SELECT id, rule, subject, evidence_id FROM risk").fetchall():
-        db.execute("UPDATE risk SET fingerprint = ? WHERE id = ?", (_fp("risk", rule, subject, ev.get(e)), rid))
-
-
-def record_run(store: "Store", repo_label: str, commit: str, llm_on: bool) -> dict:
-    """Carry history over, compare with the last comparable run, store the diff."""
-    db, prev = store.db, store.previous
-    fingerprint_findings(store)
-    now = active_findings(db)
-    if prev:
-        db.executemany(f"INSERT INTO run VALUES ({','.join('?' * 10)})", prev["runs"])
-        db.executemany("INSERT INTO change VALUES (?,?,?,?,?,?)", prev["changes"])
-    last = prev["last"] if prev else None
-    # only compare like with like: same repository and same mode (rules-only vs with LLM)
-    comparable = bool(last and last[1] == repo_label and bool(last[4]) == llm_on)
-    new = {fp: v for fp, v in now.items() if comparable and fp not in prev["findings"]}
-    resolved = {fp: v for fp, v in (prev["findings"].items() if comparable else []) if fp not in now}
-    n_conf = sum(1 for v in now.values() if v[0] == "conflict")
-    cur = db.execute(
-        "INSERT INTO run (repo, commit_sha, finished, llm, conflicts, risks, new, resolved, baseline_run) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
-        (repo_label, commit, datetime.now().isoformat(timespec="seconds"), int(llm_on), n_conf,
-         len(now) - n_conf, len(new), len(resolved), last[0] if comparable else None))
-    run_id = cur.lastrowid
-    db.executemany("INSERT INTO change VALUES (?,?,?,?,?,?)",
-                   [(run_id, v[0], "new", fp, v[1], v[2]) for fp, v in new.items()] +
-                   [(run_id, v[0], "resolved", fp, v[1], None) for fp, v in resolved.items()])
-    return {"run": run_id, "baseline": last if comparable else None, "had_previous": bool(last),
-            "new": new, "resolved": resolved}
+    for cid, kind, check, subject, evs, old in db.execute(
+            "SELECT id, kind, check_name, subject, evidence_ids, fingerprint FROM conflict").fetchall():
+        fp = _fp("conflict", kind, check, subject, sorted(ev[e] for e in json.loads(evs) if e in ev))
+        if fp != old:
+            db.execute("UPDATE conflict SET fingerprint = ? WHERE id = ?", (fp, cid))
+    for rid, rule, subject, e, old in db.execute(
+            "SELECT id, rule, subject, evidence_id, fingerprint FROM risk").fetchall():
+        fp = _fp("risk", rule, subject, ev.get(e))
+        if fp != old:
+            db.execute("UPDATE risk SET fingerprint = ? WHERE id = ?", (fp, rid))
 
 
 class Store:
-    def __init__(self, db_path: Path):
-        self.previous = load_previous(db_path)  # baseline for the run-to-run diff, read before rebuilding
-        if db_path.exists():
-            db_path.unlink()
-        self.db = sqlite3.connect(db_path)
-        self.db.executescript(SCHEMA)
-        try:
-            self.db.execute(FTS_SCHEMA)
-            self.fts = True
-        except sqlite3.OperationalError:
-            self.fts = False
-        self._components: set[str] = set()
+    """Writes knowledge records on behalf of the active extraction unit.
 
-    def source(self, s: "Source"):
-        self.db.execute(
-            "INSERT INTO source (path,kind,archived,doc_date,git_date,bytes,text) VALUES (?,?,?,?,?,?,?)",
-            (s.path, s.kind, int(s.archived), s.doc_date, s.git_date, s.size, s.text),
-        )
-        if self.fts and s.text is not None:
-            self.db.execute("INSERT INTO source_fts VALUES (?,?,?)", (s.path, s.kind, s.text))
+    Re-extracting a unit loads its previous rows as a pool keyed by their natural key:
+    an identical record keeps its row id (evidence ids, conflict ids and therefore the
+    verifier's cached prompts stay stable) and rows that are not produced again are
+    deleted by finish(). Components are declared per unit; the component table holds the
+    best declaration of every component that at least one unit still declares.
+    With no active unit (dry mode) nothing is written.
+    """
 
-    def component(self, cid: str, kind: str, name: str, path: str | None = None, **props):
-        if cid in self._components:
-            return cid
-        self._components.add(cid)
-        self.db.execute("INSERT INTO component VALUES (?,?,?,?,?)",
-                        (cid, kind, name, path, json.dumps(props) if props else None))
-        return cid
+    def __init__(self, db: sqlite3.Connection):
+        self.db = db
+        self.unit: str | None = None
+        self.step = 0
+        self.fts = bool(db.execute("SELECT 1 FROM sqlite_master WHERE name = 'source_fts'").fetchone())
+        self.stats: Counter = Counter()   # (group, added|kept|removed) record counts
+        self.mutations = 0                # knowledge rows written or deleted
+        self._pools: dict[str, dict] = {}
+        self._decls: dict[str, dict] = {}
+        self._rows: dict[str, dict] = {}
+        self._facts: dict[str, list] = {}
+        self.reload_components()
 
-    def evidence(self, path: str, line: int | None, quote: str, extractor: str) -> int:
-        cur = self.db.execute("INSERT INTO evidence (path, line, quote, extractor) VALUES (?,?,?,?)",
-                              (path, line, quote.strip()[:400], extractor))
+    # -- units ---------------------------------------------------------------
+    def reload_components(self):
+        self._known = {r[0]: tuple(r[1:]) for r in self.db.execute(
+            "SELECT id, kind, name, path, props FROM component")}
+        self._components = set(self._known)
+
+    def use(self, unit: str | None):
+        """Make `unit` the target of following writes (opening its pool on first use)."""
+        self.unit = unit
+        if unit is None or unit in self._pools:
+            return
+        pools = {}
+        for table, cols in KEYS.items():
+            pool: dict[tuple, list[int]] = {}
+            for row in self.db.execute(f"SELECT id, {', '.join(cols)} FROM {table} WHERE unit = ? ORDER BY id", (unit,)):
+                pool.setdefault(tuple(row[1:]), []).append(row[0])
+            pools[table] = pool
+        self._pools[unit] = pools
+        self._decls[unit] = {r[0]: tuple(r[1:]) for r in self.db.execute(
+            "SELECT id, rank, kind, name, path, props FROM component_decl WHERE unit = ?", (unit,))}
+        self._rows[unit] = {}
+        self._facts[unit] = []
+
+    def finish(self):
+        """Close all opened units: delete their records that were not produced again."""
+        for unit, pools in self._pools.items():
+            group = unit_group(unit)
+            for table in RECORD_TABLES:
+                ids = [i for lst in pools[table].values() for i in lst]
+                for chunk in range(0, len(ids), 500):
+                    part = ids[chunk:chunk + 500]
+                    self.db.execute(f"DELETE FROM {table} WHERE id IN ({','.join('?' * len(part))})", part)
+                self.stats[group, "removed"] += len(ids)
+                self.mutations += len(ids)
+            old, new = self._decls[unit], self._rows[unit]
+            for cid in old.keys() - new.keys():
+                self.db.execute("DELETE FROM component_decl WHERE unit = ? AND id = ?", (unit, cid))
+            for cid, row in new.items():
+                if old.get(cid) != row:
+                    self.db.execute("INSERT OR REPLACE INTO component_decl VALUES (?,?,?,?,?,?,?)", (unit, cid, *row))
+            self.db.execute("DELETE FROM unit_fact WHERE unit = ?", (unit,))
+            self.db.executemany("INSERT INTO unit_fact (unit, kind, data) VALUES (?,?,?)",
+                                [(unit, k, d) for k, d in self._facts[unit]])
+        self._pools.clear()
+        self._decls.clear()
+        self._rows.clear()
+        self._facts.clear()
+        self.unit = None
+
+    def drop(self, unit: str) -> int:
+        """Remove everything a unit produced (deleted file, invalidated or failed unit)."""
+        for d in (self._pools, self._decls, self._rows, self._facts):
+            d.pop(unit, None)
+        if self.unit == unit:
+            self.unit = None
+        n = sum(self.db.execute(f"DELETE FROM {t} WHERE unit = ?", (unit,)).rowcount for t in RECORD_TABLES)
+        for table in ("component_decl", "unit_fact", "extraction_unit"):
+            self.db.execute(f"DELETE FROM {table} WHERE unit = ?", (unit,))
+        self.stats[unit_group(unit), "removed"] += n
+        self.mutations += n
+        return n
+
+    def mark(self, unit: str, stage: str, commit: str, signature: str, *, path=None, blob=None,
+             context=None, status="complete"):
+        self.db.execute("INSERT OR REPLACE INTO extraction_unit VALUES (?,?,?,?,?,?,?,?)",
+                        (unit, stage, path, blob, signature, context, status, commit))
+
+    def materialize(self) -> int:
+        """Bring the component table in line with the current declarations; returns rows changed."""
+        want = {r[0]: tuple(r[1:]) for r in self.db.execute(
+            "SELECT id, kind, name, path, props FROM (SELECT *, ROW_NUMBER() OVER "
+            "(PARTITION BY id ORDER BY rank, unit) AS rn FROM component_decl) WHERE rn = 1")}
+        have = {r[0]: tuple(r[1:]) for r in self.db.execute("SELECT id, kind, name, path, props FROM component")}
+        changed = 0
+        for cid in have.keys() - want.keys():
+            self.db.execute("DELETE FROM component WHERE id = ?", (cid,))
+            changed += 1
+        for cid, row in want.items():
+            if have.get(cid) != row:
+                self.db.execute("INSERT OR REPLACE INTO component VALUES (?,?,?,?,?)", (cid, *row))
+                changed += 1
+        self.mutations += changed
+        self.reload_components()
+        return changed
+
+    # -- records -------------------------------------------------------------
+    def _put(self, table: str, key: tuple, extra: dict | None = None) -> int | None:
+        if self.unit is None:
+            return None
+        group = unit_group(self.unit)
+        ids = self._pools[self.unit][table].get(key)
+        if ids:
+            self.stats[group, "kept"] += 1
+            return ids.pop(0)
+        extra = extra or {}
+        cols = KEYS[table] + tuple(extra) + ("unit",)
+        cur = self.db.execute(f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                              (*key, *extra.values(), self.unit))
+        self.stats[group, "added"] += 1
+        self.mutations += 1
         return cur.lastrowid
 
-    def relation(self, src, rtype, dst, status, confidence, ev, **props):
-        self.db.execute(
-            "INSERT INTO relation (src,type,dst,status,confidence,evidence_id,props) VALUES (?,?,?,?,?,?,?)",
-            (src, rtype, dst, status, confidence, ev, json.dumps(props) if props else None))
+    def component(self, cid: str, kind: str, name: str, path: str | None = None, **props):
+        return self._declare(cid, kind, name, path, json.dumps(props) if props else None)
 
-    def conflict(self, kind, check, subject, description, confidence, evidence_ids):
-        self.db.execute(
-            "INSERT INTO conflict (kind,check_name,subject,description,confidence,evidence_ids) VALUES (?,?,?,?,?,?)",
-            (kind, check, subject, description, confidence, json.dumps(sorted(set(evidence_ids)))))
+    def keep(self, cid: str) -> str:
+        """Declare an existing component from the active unit, so it lives as long as the unit refers to it."""
+        kind, name, path, props = self._known[cid]
+        return self._declare(cid, kind, name, path, props)
+
+    def _declare(self, cid, kind, name, path, props) -> str:
+        if self.unit is None:
+            return cid
+        rows = self._rows[self.unit]
+        if cid not in rows:
+            rank = 0 if self.unit == DERIVED else 100 if self.unit.startswith("llm:") else self.step
+            self._set_decl(cid, (rank, kind, name, path, props))
+        self._components.add(cid)
+        self._known.setdefault(cid, (kind, name, path, props))
+        return cid
+
+    def declared(self, cid: str) -> tuple | None:
+        """(kind, name, path, props) as declared by the active unit in this run."""
+        row = self._rows.get(self.unit, {}).get(cid)
+        return row[1:] if row else None
+
+    def redeclare(self, cid: str, kind: str, props: dict | None):
+        """Change the active unit's own declaration (e.g. kind decided once the whole corpus is known)."""
+        rank, _, name, path, _ = self._rows[self.unit][cid]
+        self._set_decl(cid, (rank, kind, name, path, json.dumps(props) if props else None))
+
+    def _set_decl(self, cid, row):
+        self._rows[self.unit][cid] = row  # written (if changed) by finish()
+
+    def fact(self, kind: str, data):
+        if self.unit is not None:
+            self._facts[self.unit].append((kind, json.dumps(data)))
+
+    def evidence(self, path: str, line: int | None, quote: str, extractor: str) -> int:
+        return self._put("evidence", (path, line, quote.strip()[:400], extractor))
+
+    def relation(self, src, rtype, dst, status, confidence, ev, **props):
+        self._put("relation", (src, rtype, dst, status, confidence, ev, json.dumps(props) if props else None))
+
+    def conflict(self, kind, check, subject, description, confidence, evidence_ids, verdict=None):
+        return self._put("conflict", (kind, check, subject, description, confidence,
+                                      json.dumps(sorted(set(evidence_ids)))),
+                         {"confidence": confidence, "verdict": verdict})
+
+    def claim(self, component, topic, text, path, doc_date, doc_status, ev):
+        self._put("claim", (component, topic, text, path, doc_date, doc_status, ev))
 
     def risk(self, rule, severity, subject, description, guidance, confidence, ev):
-        self.db.execute(
-            "INSERT INTO risk (rule,severity,subject,description,guidance,confidence,evidence_id) VALUES (?,?,?,?,?,?,?)",
-            (rule, severity, subject, description, guidance, confidence, ev))
+        self._put("risk", (rule, severity, subject, description, guidance, confidence, ev))
 
-    def close(self):
-        self.db.commit()
-        self.db.close()
+    # -- sources -------------------------------------------------------------
+    def set_text(self, path: str, kind: str, text: str | None):
+        """source.text and its full-text index row, kept in step."""
+        self.db.execute("UPDATE source SET text = ? WHERE path = ?", (text, path))
+        self.set_fts(path, kind, text)
+
+    def set_fts(self, path: str, kind: str, text: str | None):
+        if self.fts:
+            self.db.execute("DELETE FROM source_fts WHERE path = ?", (path,))
+            if text is not None:
+                self.db.execute("INSERT INTO source_fts VALUES (?,?,?)", (path, kind, text))
+
+
+def integrity_problems(db: sqlite3.Connection) -> list[str]:
+    """References that would dangle after this update; any hit aborts the transaction."""
+    checks = {
+        "relation without evidence": "SELECT COUNT(*) FROM relation WHERE evidence_id NOT IN (SELECT id FROM evidence)",
+        "claim without evidence": "SELECT COUNT(*) FROM claim WHERE evidence_id NOT IN (SELECT id FROM evidence)",
+        "risk without evidence": "SELECT COUNT(*) FROM risk WHERE evidence_id NOT IN (SELECT id FROM evidence)",
+        "conflict citing missing evidence": "SELECT COUNT(*) FROM conflict c, json_each(c.evidence_ids) j "
+                                            "WHERE j.value NOT IN (SELECT id FROM evidence)",
+        "evidence for a file not in the snapshot": "SELECT COUNT(*) FROM evidence WHERE path NOT IN (SELECT path FROM source)",
+        "relation from unknown component": "SELECT COUNT(*) FROM relation WHERE src NOT IN (SELECT id FROM component)",
+        "relation to unknown component/source": "SELECT COUNT(*) FROM relation WHERE dst NOT IN (SELECT id FROM component) "
+                                                "AND NOT (dst LIKE 'source:%' AND substr(dst, 8) IN (SELECT path FROM source))",
+        "claim about unknown component": "SELECT COUNT(*) FROM claim WHERE component NOT IN (SELECT id FROM component)",
+        "source without blob id": "SELECT COUNT(*) FROM source WHERE blob IS NULL",
+    }
+    for table in RECORD_TABLES:
+        checks[f"{table} without a recorded unit"] = (
+            f"SELECT COUNT(*) FROM {table} WHERE unit IS NULL OR unit NOT IN (SELECT unit FROM extraction_unit)")
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name = 'source_fts'").fetchone():
+        checks["search index out of step with sources"] = (
+            "SELECT (SELECT COUNT(*) FROM source_fts) != (SELECT COUNT(*) FROM source WHERE text IS NOT NULL) "
+            "OR EXISTS (SELECT 1 FROM source_fts f WHERE f.path NOT IN (SELECT path FROM source WHERE text IS NOT NULL))"
+            "OR EXISTS (SELECT 1 FROM source_fts f JOIN source s ON s.path = f.path WHERE f.kind != s.kind)")
+    return [f"{name}: {n}" for name, q in checks.items() if (n := db.execute(q).fetchone()[0])]
 
 
 # --------------------------------------------------------------------------
@@ -329,6 +634,7 @@ class Source:
     doc_date: str | None = None
     git_date: str | None = None
     lines: list[str] = field(default_factory=list)
+    blob: str | None = None      # Git blob id at the snapshot commit
 
     @property
     def segs(self) -> list[str]:
@@ -394,10 +700,6 @@ def classify(rel: str, text: str | None, size: int) -> str:
     return "other"
 
 
-def git(repo: Path, *args) -> str:
-    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout
-
-
 def prepare_repo(url: str, repo: Path | None) -> Path:
     if repo:
         return repo
@@ -411,8 +713,9 @@ def prepare_repo(url: str, repo: Path | None) -> Path:
     return target
 
 
-def git_dates(repo: Path) -> dict[str, str]:
-    out = git(repo, "log", "--format=@%cs", "--name-only")
+def git_dates(repo: Path, head: str) -> dict[str, str]:
+    """Last commit date per file (one git call)."""
+    out = gitsnap.git(repo, "log", "--format=@%cs", "--name-only", head).decode(errors="replace")
     dates: dict[str, str] = {}
     current = None
     for line in out.splitlines():
@@ -423,29 +726,33 @@ def git_dates(repo: Path) -> dict[str, str]:
     return dates
 
 
-def collect(repo: Path) -> list[Source]:
-    files = git(repo, "ls-files").splitlines()
-    dates = git_dates(repo)
+def collect(snap: gitsnap.Snapshot) -> list[Source]:
+    """Every tracked regular file at HEAD, read from the Git object store by blob id."""
+    dates = git_dates(snap.repo, snap.head)
+
+    def readable(rel: str) -> bool:
+        name = rel.rsplit("/", 1)[-1].lower()
+        return (PurePosixPath(name).suffix not in BINARY_EXT and name not in LOCKFILES
+                and snap.sizes[rel] < 2_000_000)
+
+    blobs = gitsnap.read_blobs(snap.repo, [oid for rel, oid in snap.files.items() if readable(rel)])
     sources = []
-    for rel in files:
-        full = repo / rel
-        if not full.is_file() or full.is_symlink():
-            continue
-        size = full.stat().st_size
-        ext = PurePosixPath(rel.lower()).suffix
+    for rel, oid in snap.files.items():
+        size = snap.sizes[rel]
         text = None
-        if ext not in BINARY_EXT and rel.rsplit("/", 1)[-1].lower() not in LOCKFILES and size < 2_000_000:
-            try:
-                text = full.read_text(encoding="utf-8")
+        if readable(rel):
+            try:  # same newline handling as Path.read_text()
+                text = blobs[oid].decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
             except UnicodeDecodeError:
                 text = None
-        kind = classify(rel, text, size)
+        kind = classify(rel, text, size)  # content sniffing needs the text first
         if text is None and kind not in {"diagram", "lockfile"}:
             kind = "binary"
         archived = bool({p.lower() for p in rel.split("/")[:-1]} & ARCHIVE_SEGS)
         head = "\n".join((text or "").splitlines()[:8])
         m = DATE_RE.search(rel) or DATE_RE.search(head)
-        s = Source(rel, kind, archived, size, text, doc_date=m.group(1) if m else None, git_date=dates.get(rel))
+        s = Source(rel, kind, archived, size, text, doc_date=m.group(1) if m else None,
+                   git_date=dates.get(rel), blob=oid)
         s.lines = (text or "").splitlines()
         sources.append(s)
     return sources
@@ -517,8 +824,88 @@ class Ctx:
     deploy_deps: list[tuple[str, str, int]] = field(default_factory=list)
     tables: dict[str, dict[str, set[str]]] = field(default_factory=dict)     # cid -> table -> cols
     dropped: list[tuple[str, str, str, int]] = field(default_factory=list)   # cid, table, col, ev
-    seen_rel: set[tuple] = field(default_factory=set)
     unresolved: list[tuple[str, str]] = field(default_factory=list)  # (file, target hint) nobody matched
+    owned: set[str] = field(default_factory=set)                     # components with a CODEOWNERS rule
+    depends: set[tuple[str, str]] = field(default_factory=set)       # internal DEPENDS_ON (src, dst)
+    regen: set[str] = field(default_factory=set)  # paths whose file-local results are re-extracted
+    repo: Path | None = None
+    blobs: dict[str, bytes] = field(default_factory=dict)
+    _seen: dict = field(default_factory=dict)     # unit -> dedupe keys (file-local, never cross-file)
+    _facts: list = field(default_factory=list)    # (order, kind, value, key) from file-local extraction
+    _seq: int = 0
+
+    def reset(self):
+        """Forget everything derived from the corpus (before a fresh pass over it)."""
+        for name in ("comp_dirs", "aliases", "ports", "tables", "_seen"):
+            getattr(self, name).clear()
+        for name in ("archived_comps", "owned", "depends"):
+            getattr(self, name).clear()
+        for name in ("endpoints", "calls", "deploy_deps", "dropped", "unresolved", "_facts"):
+            getattr(self, name).clear()
+
+    @property
+    def seen_rel(self) -> set:
+        """Dedupe keys of the active unit: results of one file never depend on another file."""
+        return self._seen.setdefault(self.store.unit, set())
+
+    # ---- facts: what file-local extraction contributes to the cross-source checks. Persisted
+    # per unit (unit_fact), so unchanged files do not need to be re-extracted.
+    def _add_fact(self, kind: str, value: list, key: list | None):
+        self._seq += 1
+        order = [self.store.step, self.store.unit or "", self._seq]  # = full-run extraction order
+        self._facts.append((order, kind, value, key))
+        self.store.fact(kind, {"order": order, "value": value, "key": key})
+
+    def load_facts(self, units: list[str]):
+        for i in range(0, len(units), 500):
+            part = units[i:i + 500]
+            for kind, data in self.store.db.execute(
+                    f"SELECT kind, data FROM unit_fact WHERE unit IN ({','.join('?' * len(part))})", part):
+                d = json.loads(data)
+                self._facts.append((d["order"], kind, d["value"], d.get("key")))
+
+    def sort_facts(self):
+        """Endpoints/calls/deps in full-run order; the first file to report a key wins, as before."""
+        self._facts.sort(key=lambda f: f[0])
+        seen = set()
+        self.endpoints, self.calls, self.depends = [], [], set()
+        for _, kind, value, key in self._facts:
+            if key is not None:
+                k = json.dumps([kind, key])
+                if k in seen:
+                    continue
+                seen.add(k)
+            if kind == "endpoint":
+                self.endpoints.append(Endpoint(*value))
+            elif kind == "call":
+                self.calls.append(tuple(value))
+            elif kind == "depends":
+                self.depends.add(tuple(value))
+
+    def seed_seen(self, unit: str):
+        """Dedupe keys of another unit of the same file (the LLM pass adds what the rules missed)."""
+        seen = self.seen_rel
+        for kind, data in self.store.db.execute("SELECT kind, data FROM unit_fact WHERE unit = ?", (unit,)):
+            key = json.loads(data).get("key")
+            if kind == "endpoint" and key and key[0] == "ep":
+                seen.add(tuple(key[1:]))
+            elif kind == "call" and key:
+                seen.add((key[1], key[2], "CALLS", key[3], key[4]))
+            elif kind == "seen":
+                seen.add(tuple(json.loads(data)["value"]))
+
+    def local_sources(self):
+        """Sources whose file-local results are re-extracted in this run; writes go to their unit."""
+        for s in self.sources.values():
+            if s.path in self.regen:
+                self.store.use(f"det:{s.path}")
+                yield s
+
+    def read_blob(self, path: str) -> bytes:
+        oid = self.sources[path].blob
+        if oid not in self.blobs:
+            self.blobs.update(gitsnap.read_blobs(self.repo, [oid]))
+        return self.blobs[oid]
 
     # ---- components
     def owner(self, path: str) -> str | None:
@@ -632,7 +1019,7 @@ class Ctx:
             eid = self.store.component(f"endpoint:{self.short(cid)} {method} {n}", "endpoint",
                                        f"{method} {path}", src_path, service=self.short(cid))
             self.store.relation(cid, rel, eid, status, confidence, ev)
-        self.endpoints.append(Endpoint(cid, method, path, n, origin, ev))
+        self._add_fact("endpoint", [cid, method, path, n, origin, ev], ["ep", cid, origin, method, n])
         return True
 
     def add_call(self, caller: str, callee: str, ev: int, status: str, confidence: float,
@@ -648,9 +1035,10 @@ class Ctx:
             props["path"] = norm_path(path)
         self.store.relation(caller, extractor_rel, callee, status, confidence, ev, **props)
         if extractor_rel == "CALLS":
-            self.calls.append((caller, callee, ev))
+            fkey = ["call", caller, callee, props["method"], props.get("path")]
+            self._add_fact("call", [caller, callee, ev], fkey)
             if path:
-                self.endpoints.append(Endpoint(callee, props["method"], path, norm_path(path), "call", ev))
+                self._add_fact("endpoint", [callee, props["method"], path, norm_path(path), "call", ev], fkey)
 
 
 # --------------------------------------------------------------------------
@@ -698,13 +1086,15 @@ def discover_components(ctx: Ctx):
     dirs = merged
     if not dirs:
         dirs[""] = []      # single-project repo without a manifest
+    taken: set[str] = set()
     for d in sorted(dirs):
         files = dirs[d]
         name = next((n for n in (manifest_name(f) for f in files) if n), None) or d.rsplit("/", 1)[-1] or ctx.repo_name
         short = (d.rsplit("/", 1)[-1] or ctx.repo_name).lower()
         cid = f"comp:{short}"
-        if cid in st._components:
+        if cid in taken:
             cid = f"comp:{d.lower()}"
+        taken.add(cid)
         archived = bool({p.lower() for p in d.split("/")} & ARCHIVE_SEGS)
         st.component(cid, "project", name, d or ".", archived=archived,
                      manifests=[f.name for f in files])
@@ -717,7 +1107,7 @@ def discover_components(ctx: Ctx):
 
 def extract_manifests(ctx: Ctx):
     st = ctx.store
-    for s in ctx.sources.values():
+    for s in ctx.local_sources():
         if s.kind != "dependency_manifest" or not s.text:
             continue
         src = ctx.comp_dirs.get(s.path.rsplit("/", 1)[0] if "/" in s.path else "")
@@ -730,6 +1120,7 @@ def extract_manifests(ctx: Ctx):
                                            or ctx._alias(dep)) else None
             if internal and internal != src:
                 st.relation(src, "DEPENDS_ON", internal, status, 0.95, ev, dev=dev, version=ver)
+                ctx._add_fact("depends", [src, internal], None)
             else:
                 lib = st.component(f"lib:{dep.lower()}", "library-ext", dep)
                 st.relation(src, "USES_LIBRARY", lib, status, 0.95, ev, version=ver, dev=dev)
@@ -950,7 +1341,7 @@ METHOD_HINT = re.compile(r"method\s*[:=]\s*[\"'](\w+)|\.(get|post|put|patch|dele
 
 def extract_code(ctx: Ctx):
     st = ctx.store
-    for s in ctx.sources.values():
+    for s in ctx.local_sources():
         if s.kind not in {"code", "test"} or not s.text:
             continue
         src = ctx.owner(s.path)
@@ -1022,6 +1413,7 @@ def extract_code(ctx: Ctx):
                 if key not in ctx.seen_rel:
                     ctx.seen_rel.add(key)
                     st.relation(src, op, tid, status, 0.85, st.evidence(s.path, ln, sql, "sql-in-code"))
+                    ctx._add_fact("seen", list(key), None)  # lets the LLM pass skip it
 
 
 def _method(s: Source, ln: int) -> str:
@@ -1048,7 +1440,7 @@ def load_spec(s: Source):
 
 def extract_specs(ctx: Ctx):
     st = ctx.store
-    for s in ctx.sources.values():
+    for s in ctx.local_sources():
         if s.kind != "api_spec":
             continue
         spec = load_spec(s)
@@ -1110,9 +1502,9 @@ def extract_schemas(ctx: Ctx):
         last = files[-1]
         for t, cols in prev.items():
             ev = st.evidence(last.path, None, f"final schema of {t}: {', '.join(sorted(cols))}", "migration-replay")
-            tid = st.component(f"table:{ctx.short(cid)}.{t}", "table", t, None, service=ctx.short(cid))
-            st.db.execute("UPDATE component SET props = ? WHERE id = ?",
-                          (json.dumps({"service": ctx.short(cid), "columns": sorted(cols)}), tid))
+            # outranks the sql-in-code declaration of the same table, so the live columns win
+            tid = st.component(f"table:{ctx.short(cid)}.{t}", "table", t, None, service=ctx.short(cid),
+                               columns=sorted(cols))
             st.relation(cid, "HAS_TABLE", tid, "outdated" if last.archived else "observed", 0.95, ev)
 
 
@@ -1154,6 +1546,7 @@ def extract_owners(ctx: Ctx):
             ev = st.evidence(s.path, winner[2], winner[3], "codeowners")
             for o in winner[1]:
                 st.relation(cid, "OWNED_BY", st.component(f"team:{o}", "team", o), "observed", 0.95, ev)
+                ctx.owned.add(cid)
 
 
 DOC_KINDS = {"doc", "wiki", "adr", "runbook", "meeting_note", "incident", "issue", "release_note",
@@ -1164,7 +1557,7 @@ DOC_ENDPOINT = re.compile(r"\b(GET|POST|PUT|PATCH|DELETE)\s+(/[A-Za-z0-9_/{}:.\-
 def extract_docs(ctx: Ctx):
     st = ctx.store
     names = sorted(((a, cid) for a, cid in ctx.aliases.items() if cid and len(a) >= 4), key=lambda x: -len(x[0]))
-    for s in ctx.sources.values():
+    for s in ctx.local_sources():
         if s.kind not in DOC_KINDS or not s.text:
             continue
         hit = set()
@@ -1180,26 +1573,29 @@ def extract_docs(ctx: Ctx):
         for m in DOC_ENDPOINT.finditer(s.text):
             ln = line_at(s, m.start())
             ev = st.evidence(s.path, ln, s.lines[ln - 1], "doc-endpoint")
-            ctx.endpoints.append(Endpoint("?", m.group(1), m.group(2), norm_path(m.group(2)), "doc", ev))
+            ctx._add_fact("endpoint", ["?", m.group(1), m.group(2), norm_path(m.group(2)), "doc", ev], None)
 
 
 def finalize_components(ctx: Ctx):
     """service = exposes routes or listens on a port; library = others depend on it; else project."""
-    db = ctx.store.db
-    exposes = {r[0] for r in db.execute("SELECT DISTINCT src FROM relation WHERE type='EXPOSES'")}
+    st = ctx.store
+    exposes = {e.service for e in ctx.endpoints if e.origin == "code"}
     listened = {c for cids in ctx.ports.values() for c in cids}
-    depended = {r[0] for r in db.execute("SELECT DISTINCT dst FROM relation WHERE type='DEPENDS_ON'")}
+    depended = {dst for _, dst in ctx.depends}
+    final: dict[str, tuple[str, dict]] = {}
     for cid in ctx.comp_dirs.values():
-        kind = "service" if cid in exposes or cid in listened else "library" if cid in depended else "project"
-        db.execute("UPDATE component SET kind = ? WHERE id = ?", (kind, cid))
+        decl = st.declared(cid)
+        if decl:
+            kind = "service" if cid in exposes or cid in listened else "library" if cid in depended else "project"
+            final[cid] = (kind, json.loads(decl[3] or "{}"))
     for port, cids in ctx.ports.items():
         for cid in cids:
-            row = db.execute("SELECT props FROM component WHERE id = ?", (cid,)).fetchone()
-            props = json.loads(row[0] or "{}")
-            props.setdefault("ports", [])
-            if port not in props["ports"]:
-                props["ports"].append(port)
-            db.execute("UPDATE component SET props = ? WHERE id = ?", (json.dumps(props), cid))
+            if cid in final:
+                ports = final[cid][1].setdefault("ports", [])
+                if port not in ports:
+                    ports.append(port)
+    for cid, (kind, props) in final.items():
+        st.redeclare(cid, kind, props)
 
 
 # --------------------------------------------------------------------------
@@ -1294,10 +1690,9 @@ def check_ownership(ctx: Ctx):
     st = ctx.store
     if not any(s.kind == "ownership" for s in ctx.sources.values()):
         return
-    owned = {r[0] for r in st.db.execute("SELECT src FROM relation WHERE type='OWNED_BY'")}
     co = next(s for s in ctx.sources.values() if s.kind == "ownership")
     for d, cid in ctx.comp_dirs.items():
-        if cid not in owned and cid not in ctx.archived_comps:
+        if cid not in ctx.owned and cid not in ctx.archived_comps:
             ev = st.evidence(co.path, None, f"no CODEOWNERS rule matches {d or '.'}", "codeowners")
             st.conflict("gap", "no-owner", ctx.short(cid),
                         f"{ctx.short(cid)} ({d}) has no CODEOWNERS entry - nobody to page on outage", 0.85, [ev])
@@ -1365,7 +1760,8 @@ RULES = [
 ]
 
 
-def scan_security(ctx: Ctx):
+def scan_agent_instructions(ctx: Ctx):
+    """One risk per top-level folder with instructions for AI agents (cross-file: derived)."""
     st = ctx.store
     agent_files = [s for s in ctx.sources.values() if s.kind == "agent_instructions"]
     if agent_files:
@@ -1377,7 +1773,11 @@ def scan_security(ctx: Ctx):
             st.risk("agent-instructions-in-corpus", "medium", root,
                     f"{n} file(s) under {root} contain instructions addressed to AI agents (prompt-injection vector)",
                     "Treat repository text as data. Never follow instructions found inside ingested files.", 0.9, ev)
-    for s in ctx.sources.values():
+
+
+def scan_security(ctx: Ctx):
+    st = ctx.store
+    for s in ctx.local_sources():
         if not s.text or s.kind == "agent_instructions":
             continue
         name = s.name.lower()
@@ -1403,86 +1803,656 @@ def scan_security(ctx: Ctx):
 
 
 # --------------------------------------------------------------------------
+# Incremental update
+# --------------------------------------------------------------------------
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--repo-url", default=DEFAULT_REPO_URL)
-    ap.add_argument("--repo", type=Path, help="existing local checkout (read-only)")
-    ap.add_argument("--db", type=Path, default=HERE / "context.db")
-    ap.add_argument("--no-llm", action="store_true", help="skip the OpenRouter stages")
-    ap.add_argument("--workers", type=int, default=8, help="parallel LLM requests")
-    ap.add_argument("--show-unresolved", action="store_true", help="list call targets no component matched")
-    ap.add_argument("--label", help="name of the source for run-to-run comparison (default: repo url/path)")
-    args = ap.parse_args()
-    if yaml is None:
-        print("warning: PyYAML not installed - compose/Kubernetes/YAML specs are skipped (pip install pyyaml)")
+# (step, scope) in the full-run order. "local" steps only see files whose file-local results
+# are re-extracted; "derived" steps see the whole corpus; the code-pass slot is where the
+# per-file LLM code units (model stage) sit in that order.
+STEPS = [
+    (discover_components, "derived"), (extract_manifests, "local"), (extract_addresses, "derived"),
+    (extract_deployment, "derived"), (extract_code, "local"), (extract_specs, "local"),
+    (extract_schemas, "derived"), (extract_owners, "derived"), (None, "code-pass"),
+    (extract_docs, "local"), (finalize_components, "derived"), (check_endpoints, "derived"),
+    (check_deploy_vs_code, "derived"), (check_schema_drift, "derived"), (check_ownership, "derived"),
+    (scan_agent_instructions, "derived"), (scan_security, "local"),
+]
+CODE_PASS_STEP = 9
+# steps that build the shared context (components, aliases, ports) file-local extractors read
+CONTEXT_STEPS = (discover_components, extract_addresses, extract_deployment)
 
-    repo = prepare_repo(args.repo_url, args.repo)
-    sources = collect(repo)
-    store = Store(args.db)
-    for s in sources:
-        store.source(s)
-    name = (args.repo.name if args.repo else args.repo_url.rstrip("/").split("/")[-1]).removesuffix(".git").lower()
-    ctx = Ctx(store, {s.path: s for s in sources}, repo_name=name)
+# shared context each file-local extractor depends on (besides the file itself)
+FAMILY_CONTEXT = {"manifest": ("names",), "code": ("names", "ports"), "spec": ("names", "ports"),
+                  "docs": ("names",), "security": ("names",)}
+EXIT_INCOMPLETE = 3  # model enrichment requested but not complete (results so far are published)
 
-    use_llm = not args.no_llm
-    if use_llm:
-        import enrich
-        use_llm = enrich.ready()
 
-    for step in (discover_components, extract_manifests, extract_addresses, extract_deployment,
-                 extract_code, extract_specs, extract_schemas, extract_owners):
-        step(ctx)
-    if use_llm:
-        enrich.code_pass(ctx, args.workers)       # any language: routes, calls, SQL, risks
-        if args.show_unresolved:
-            for path, hint in sorted(set(ctx.unresolved)):
-                print(f"    unresolved call target {hint!r} in {path}")
-    for step in (extract_docs, finalize_components, check_endpoints, check_deploy_vs_code,
-                 check_schema_drift, check_ownership, scan_security):
-        step(ctx)
-    if use_llm:
-        enrich.enrich(ctx, repo, args.workers)    # prose, diagrams, verification
+def families(s: Source) -> list[str]:
+    """File-local extractors that process this file (mirrors their filters; a superset is harmless)."""
+    fams = []
+    if s.text is None:
+        return fams
+    if s.kind == "dependency_manifest":
+        fams.append("manifest")
+    if s.kind in {"code", "test"}:
+        fams.append("code")
+    if s.kind == "api_spec":
+        fams.append("spec")
+    if s.kind in DOC_KINDS:
+        fams.append("docs")
+    if s.kind != "agent_instructions":
+        fams.append("security")
+    return fams
 
-    commit = git(repo, "rev-parse", "--short", "HEAD").strip()
-    label = args.label or (str(args.repo.resolve()) if args.repo else args.repo_url)
-    diff = record_run(store, label, commit, use_llm)
 
-    db = store.db
-    print(f"source repo : {repo}  (HEAD {commit})")
-    print(f"database    : {args.db}")
-    print("components  :", ", ".join(f"{k} {n}" for k, n in db.execute(
-        "SELECT kind, COUNT(*) FROM component WHERE id LIKE 'comp:%' GROUP BY kind")))
-    print("files by kind:")
-    for kind, n in db.execute("SELECT kind, COUNT(*) FROM source GROUP BY kind ORDER BY 2 DESC"):
-        print(f"  {kind:<20}{n}")
-    for table in ("component", "relation", "evidence", "claim", "conflict", "risk"):
-        print(f"{table:<12}: {db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]}")
-    print("conflicts by check:")
-    for chk, v, n in db.execute("SELECT check_name, IFNULL(verdict, '-'), COUNT(*) FROM conflict GROUP BY 1, 2 ORDER BY 3 DESC"):
-        print(f"  {chk:<32}{v:<11}{n}")
-    print("risks by rule:")
-    for rule, sev, n in db.execute("SELECT rule, severity, COUNT(*) FROM risk GROUP BY 1,2 ORDER BY 3 DESC"):
-        print(f"  {rule:<32}{sev:<8}{n}")
-    print_diff(diff, commit)
-    store.close()
+def det_signature() -> str:
+    return json.dumps({"extraction_version": EXTRACTION_VERSION, "schema": SCHEMA_VERSION,
+                       "pyyaml": yaml is not None}, sort_keys=True)
+
+
+def short(commit: str | None) -> str:
+    return commit[:12] if commit else "-"
+
+
+@dataclass
+class Unit:
+    blob: str | None
+    signature: str
+    context: str | None
+    status: str
+
+
+class Ingestion:
+    def __init__(self, db: sqlite3.Connection, snap: gitsnap.Snapshot, args, repo_name: str, label: str):
+        self.db, self.snap, self.args = db, snap, args
+        self.repo_name, self.label = repo_name, label
+        self.ctx: Ctx | None = None
+        self.shared: dict[str, str] = {}
+        self.published = False
+        self.lines: list[tuple[str, str]] = []  # summary
+        self.history: tuple | None = None      # (findings before, last run row) of this invocation
+        self.run_id: int | None = None
+        self.diff: dict | None = None
+
+    # -- state ---------------------------------------------------------------
+    def stage(self, name: str) -> dict | None:
+        row = self.db.execute("SELECT commit_id, signature, status, detail FROM stage_state WHERE stage = ?",
+                              (name,)).fetchone()
+        return dict(zip(("commit", "signature", "status", "detail"), row)) if row else None
+
+    def set_stage(self, name: str, status: str, signature: str, detail: str | None = None):
+        self.db.execute("INSERT OR REPLACE INTO stage_state VALUES (?,?,?,?,?,?)",
+                        (name, self.snap.head, signature, status, detail,
+                         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+
+    def units(self) -> dict[str, Unit]:
+        return {r[0]: Unit(*r[1:]) for r in self.db.execute(
+            "SELECT unit, blob, signature, context, status FROM extraction_unit")}
+
+    def note(self, label: str, text: str):
+        self.lines.append((label, text))
+
+    # -- entry -----------------------------------------------------------------
+    def run(self) -> int:
+        db, snap = self.db, self.snap
+        state = schema_state(db)
+        det_sig, model_sig = det_signature(), enrich.model_signature()
+        want_model = not self.args.no_llm
+        det_ok = False
+        if state == "current":
+            row = db.execute("SELECT value FROM ingest_meta WHERE key = 'repo_identity'").fetchone()
+            if row and row[0] != snap.identity:
+                origin = db.execute("SELECT value FROM ingest_meta WHERE key = 'repo_remote'").fetchone()
+                raise IngestError(f"{self.args.db} was built from another repository "
+                                  f"({origin[0] if origin and origin[0] else row[0]}); use a different --db")
+            det, model = self.stage("deterministic"), self.stage("model")
+            det_ok = bool(det and det["status"] == "complete" and det["commit"] == snap.head
+                          and det["signature"] == det_sig)
+            model_ok = bool(model and model["status"] == "complete" and model["commit"] == snap.head
+                            and model["signature"] == model_sig)
+            if det_ok and (model_ok or not want_model):
+                self.note("snapshot", f"{short(snap.head)} already ingested; nothing to do (no writes, no model calls)")
+                self.note("stages", self.stage_line())
+                return 0
+        db.execute("PRAGMA journal_mode = WAL")  # readers keep seeing the last committed state
+        if det_ok:
+            self.note("snapshot", f"{short(snap.head)} (deterministic stage already complete)")
+            self.build_context()
+        else:
+            self.det_phase(state, det_sig)
+        self.published = True
+        code = self.model_phase() if want_model else 0
+        self.note("stages", self.stage_line())
+        return code
+
+    def build_context(self, sources: list[Source] | None = None):
+        """Shared extraction context (components, aliases, ports) without writing anything."""
+        sources = sources if sources is not None else collect(self.snap)
+        if self.ctx is None:
+            self.ctx = Ctx(Store(self.db), {s.path: s for s in sources}, repo_name=self.repo_name,
+                           repo=self.snap.repo)
+        ctx = self.ctx
+        ctx.reset()
+        ctx.store.use(None)
+        for step in CONTEXT_STEPS:
+            step(ctx)
+        self.shared = {
+            "names": digest([self.repo_name, sorted(ctx.comp_dirs.items()),
+                             sorted((k, v or "") for k, v in ctx.aliases.items()), sorted(ctx.archived_comps)]),
+            "ports": digest(sorted((p, sorted(c)) for p, c in ctx.ports.items())),
+        }
+
+    def code_context(self) -> str:
+        """What an LLM code unit's stored result depends on besides its file (target resolution)."""
+        return digest([self.shared["names"], self.shared["ports"], det_signature()])
+
+    def run_steps(self, fact_units: list[str], derived: bool):
+        """Run the pipeline in full-run order: re-extract ctx.regen, recompute cross-source results."""
+        ctx = self.ctx
+        st = ctx.store
+        if derived:
+            ctx.reset()
+            ctx.load_facts(fact_units)
+        for i, (step, scope) in enumerate(STEPS, 1):
+            st.step = i
+            if step is None:
+                continue  # code pass: model stage
+            if scope == "local":
+                if ctx.regen:
+                    step(ctx)
+            elif derived:
+                if step is finalize_components:
+                    ctx.sort_facts()
+                st.use(DERIVED)
+                step(ctx)
+
+    # -- deterministic stage ---------------------------------------------------
+    def det_phase(self, state: str, det_sig: str):
+        db, snap = self.db, self.snap
+        sources = collect(snap)  # reads Git objects only, before the transaction
+        with transaction(db):
+            self.capture_history()
+            mode = "incremental update"
+            if state == "empty":
+                create_schema(db)
+                mode = "initial build"
+            elif state == "legacy":
+                migrate_legacy(db)
+                mode = "legacy schema migrated to v2 (one-time full refresh)"
+            det = self.stage("deterministic")
+            prev = det["commit"] if det else None
+            if det and det["signature"] != det_sig:
+                mode = f"extraction signature changed ({det['signature']} -> {det_sig}): every file re-extracted"
+            st = Store(db)
+            ctx = self.ctx = Ctx(st, {s.path: s for s in sources}, repo_name=self.repo_name, repo=snap.repo)
+            model_files = {u for u in self.units() if u.startswith("llm:") and u not in (DIAGRAM_CHECK, VERIFY)}
+
+            # 1. which files changed (Git diff between the stored and the current commit)
+            old = {r[0]: r[1:] for r in db.execute(
+                "SELECT path, blob, det_kind, archived, bytes, git_date FROM source")}
+            added, modified, deleted = self.changed_files(prev, old)
+            self.note("snapshot", f"{short(prev)} -> {short(snap.head)}  [{mode}]")
+            self.note("files", f"{len(added)} added, {len(modified)} modified, {len(deleted)} deleted, "
+                               f"{len(snap.files) - len(added) - len(modified)} unchanged")
+            for path in deleted:
+                db.execute("DELETE FROM source WHERE path = ?", (path,))
+                st.set_fts(path, "", None)
+                for unit in (f"det:{path}", f"{CODE_UNIT}{path}", f"llm:{path}"):
+                    st.drop(unit)
+            dates_changed = False
+            for s in sources:
+                dates_changed |= self.write_source(st, s, old.get(s.path))
+
+            # 2. which file-local units must be re-extracted
+            self.build_context(sources)
+            units = self.units()
+            reasons: Counter = Counter()
+            expected: dict[str, str] = {}
+            unprocessed = 0
+            for s in sources:
+                unit, fams = f"det:{s.path}", families(s)
+                if not fams:
+                    unprocessed += 1
+                    if unit in units:
+                        st.drop(unit)
+                    continue
+                expected[s.path] = digest({f: [self.shared[k] for k in FAMILY_CONTEXT[f]] for f in fams})
+                row = units.get(unit)
+                reason = ("new" if row is None else "content" if row.blob != s.blob
+                          else "version" if row.signature != det_sig
+                          else "shared context" if row.context != expected[s.path] else None)
+                if reason:
+                    ctx.regen.add(s.path)
+                    reasons[reason] += 1
+            # LLM code units feed the cross-source checks: drop the ones that no longer match first
+            code_dropped = self.invalidate_code_units(st)
+            text_changed = bool(added or deleted) or any(
+                ctx.sources[p].text is not None or old[p][1] not in {"diagram", "binary", "lockfile"} for p in modified)
+            derived = (bool(ctx.regen) or text_changed or dates_changed or bool(code_dropped)
+                       or DERIVED not in units or units[DERIVED].signature != det_sig)
+
+            # 3. extraction: re-extract changed units, recompute cross-source results
+            self.run_steps([f"det:{p}" for p in expected if p not in ctx.regen] + self.code_units(), derived)
+            st.finish()
+            for path in ctx.regen:
+                st.mark(f"det:{path}", "deterministic", snap.head, det_sig, path=path,
+                        blob=ctx.sources[path].blob, context=expected[path])
+            if derived:
+                st.mark(DERIVED, "deterministic", snap.head, det_sig)
+            st.materialize()
+            regen = ", ".join(f"{n} {r}" for r, n in reasons.most_common())
+            self.note("rules", f"{len(ctx.regen)} files re-extracted" + (f" ({regen})" if regen else "")
+                      + f", {len(expected) - len(ctx.regen)} reused, {unprocessed} not processed by rules")
+            self.note("cross-source", ("checks recomputed" if derived else
+                                       "checks not needed (no input changed)")
+                      + "; " + self.record_line(st.stats, ("file", "derived")))
+
+            # 4. model-stage results that no longer match this snapshot
+            self.invalidate_model(st)
+            dropped = len(model_files - self.units().keys())
+            mutated = st.mutations
+            if mutated or DIAGRAM_CHECK not in units:
+                self.check_diagrams(st)
+            reset = bool(st.mutations) and (VERIFY in units or DIAGRAM_CHECK in units)
+            if st.mutations:
+                self.reset_verification(st)
+            st.materialize()
+            if dropped or reset:
+                self.note("model data", f"{dropped} file results invalidated"
+                          + ("; verification reset (knowledge changed)" if reset else ""))
+
+            self.publish_checks()
+            db.execute("INSERT OR REPLACE INTO ingest_meta VALUES ('repo_identity', ?), ('repo_remote', ?)",
+                       (snap.identity, snap.remote))
+            self.set_stage("deterministic", "complete", det_sig)
+            self.update_model_stage()
+            self.record_run()
+
+    def changed_files(self, prev: str | None, old: dict) -> tuple[list[str], list[str], list[str]]:
+        snap = self.snap
+        cur = snap.files
+        by_blob = ([p for p in cur if p not in old], [p for p in cur if p in old and old[p][0] != cur[p]],
+                   [p for p in old if p not in cur])
+        if not prev or not old:
+            return by_blob
+        if prev == snap.head:
+            changes, how = {}, "same commit"
+        elif gitsnap.has_commit(snap.repo, prev):
+            changes, how = gitsnap.diff_paths(snap.repo, prev, snap.head), f"git diff {short(prev)}..{short(snap.head)}"
+        else:
+            self.note("diff", f"stored commit {short(prev)} is not in this checkout's history; compared stored blob ids")
+            return by_blob
+        added = [p for p in changes if p in cur and p not in old]
+        modified = [p for p in changes if p in cur and p in old and old[p][0] != cur[p]]
+        deleted = [p for p in changes if p in old and p not in cur]
+        # blob ids are authoritative: anything the diff missed (e.g. an interrupted older run) is resynced
+        extra = [set(b) - set(a) for a, b in zip((added, modified, deleted), by_blob)]
+        n_extra = sum(len(e) for e in extra)
+        self.note("diff", how + (f"; {n_extra} more files differed from stored blob ids" if n_extra else ""))
+        return tuple(a + sorted(e) for a, e in zip((added, modified, deleted), extra))
+
+    def write_source(self, st: Store, s: Source, old: tuple | None) -> bool:
+        """Insert/refresh one source row; returns True if only a text file's git date moved."""
+        if old is None:
+            self.db.execute("INSERT INTO source (path, kind, det_kind, archived, doc_date, git_date, bytes, text, blob) "
+                            "VALUES (?,?,?,?,?,?,?,?,?)",
+                            (s.path, s.kind, s.kind, int(s.archived), s.doc_date, s.git_date, s.size, s.text, s.blob))
+            st.set_fts(s.path, s.kind, s.text)
+            return False
+        blob, det_kind, archived, size, git_date = old
+        if (blob, det_kind, archived, size) != (s.blob, s.kind, int(s.archived), s.size):
+            self.db.execute("UPDATE source SET kind = ?, det_kind = ?, archived = ?, doc_date = ?, git_date = ?, "
+                            "bytes = ?, blob = ?, doc_status = NULL, summary = NULL WHERE path = ?",
+                            (s.kind, s.kind, int(s.archived), s.doc_date, s.git_date, s.size, s.blob, s.path))
+            st.set_text(s.path, s.kind, s.text)
+            for unit in (f"{CODE_UNIT}{s.path}", f"llm:{s.path}"):
+                st.drop(unit)  # model output describes the previous contents
+            return False
+        if git_date != s.git_date:
+            self.db.execute("UPDATE source SET git_date = ? WHERE path = ?", (s.git_date, s.path))
+            return s.text is not None
+        return False
+
+    # -- model stage -------------------------------------------------------------
+    def model_units(self) -> dict[str, tuple[Source, str]]:
+        ctx = self.ctx
+        units = {f"{CODE_UNIT}{s.path}": (s, "code") for s in enrich.code_sources(ctx)}
+        units.update({f"llm:{s.path}": (s, "prose") for s in enrich.prose_sources(ctx)})
+        units.update({f"llm:{s.path}": (s, "diagram") for s in enrich.diagram_sources(ctx)})
+        return units
+
+    def code_units(self) -> list[str]:
+        """Complete LLM code units whose facts take part in the cross-source checks."""
+        return [u for u, row in self.units().items() if u.startswith(CODE_UNIT) and row.status == "complete"]
+
+    def unit_context(self, kind: str, catalog: str | None = None) -> str:
+        return self.code_context() if kind == "code" else digest(catalog if catalog is not None
+                                                                 else enrich.catalog_text(self.ctx))
+
+    def invalidate_code_units(self, st: Store) -> int:
+        want = {u: s for u, (s, kind) in self.model_units().items() if kind == "code"}
+        context, dropped = self.code_context(), 0
+        for unit, row in self.units().items():
+            if unit.startswith(CODE_UNIT) and (unit not in want or row.blob != want[unit].blob
+                                               or row.context != context):
+                st.drop(unit)
+                dropped += 1
+        return dropped
+
+    def invalidate_model(self, st: Store):
+        """Drop prose/diagram results whose file, blob or component catalog no longer match (any mode)."""
+        catalog = digest(enrich.catalog_text(self.ctx))
+        want = self.model_units()
+        for unit, row in self.units().items():
+            if not unit.startswith("llm:") or unit.startswith(CODE_UNIT) or unit in (DIAGRAM_CHECK, VERIFY):
+                continue
+            if unit not in want or row.blob != want[unit][0].blob or row.context != catalog:
+                st.drop(unit)
+                if unit[4:] in self.ctx.sources:
+                    self.reset_model_columns(st, self.ctx.sources[unit[4:]])
+
+    def reset_model_columns(self, st: Store, s: Source):
+        self.db.execute("UPDATE source SET kind = det_kind, doc_status = NULL, summary = NULL, doc_date = ? "
+                        "WHERE path = ?", (s.doc_date, s.path))
+        st.set_text(s.path, s.kind, s.text)  # diagram description removed; FTS kind back to the rule-based one
+
+    def check_diagrams(self, st: Store):
+        st.use(DIAGRAM_CHECK)
+        enrich.check_diagrams(self.ctx)
+        st.finish()
+        st.mark(DIAGRAM_CHECK, "model", self.snap.head, "diagram edges vs observed relations")
+
+    def reset_verification(self, st: Store):
+        st.drop(VERIFY)
+        self.db.execute("UPDATE conflict SET verdict = NULL, rationale = NULL, confidence = base_confidence "
+                        "WHERE verdict IN ('confirmed', 'rejected')")
+
+    def model_pending(self) -> list[str]:
+        sigs = enrich.signatures()
+        catalog = digest(enrich.catalog_text(self.ctx))
+        units = self.units()
+        pending = []
+        for u, (s, kind) in self.model_units().items():
+            row = units.get(u)
+            context = self.code_context() if kind == "code" else catalog
+            if (row is None or row.status != "complete" or row.blob != s.blob or row.signature != sigs[kind]
+                    or row.context != context):
+                pending.append(u)
+        for u, sig in ((DIAGRAM_CHECK, None), (VERIFY, sigs["verify"])):
+            row = units.get(u)
+            if row is None or row.status != "complete" or (sig and row.signature != sig):
+                pending.append(u)
+        return pending
+
+    def update_model_stage(self, failures: str | None = None):
+        pending = self.model_pending()
+        if not pending:
+            self.set_stage("model", "complete", enrich.model_signature())
+            return
+        files = sum(1 for u in pending if u not in (DIAGRAM_CHECK, VERIFY))
+        why = failures or ("not requested (--no-llm)" if self.args.no_llm else "not run")
+        self.set_stage("model", "incomplete", enrich.model_signature(),
+                       f"{why}; pending: {files} files" + (", verification" if VERIFY in pending else ""))
+
+    def model_phase(self) -> int:
+        db, ctx, snap = self.db, self.ctx, self.snap
+        if not self.model_pending():
+            return 0
+        if not llm.available():
+            with transaction(db):
+                self.update_model_stage("credentials missing: OPENROUTER_API_KEY is not set (environment or .env)")
+                if self.run_id is not None:  # this invocation already published a deterministic update
+                    self.record_run()
+            self.note("model", "NOT RUN - OPENROUTER_API_KEY is not set (environment or .env); deterministic "
+                               "results are published, model stage stays incomplete")
+            return EXIT_INCOMPLETE
+        sigs = enrich.signatures()
+        workers = self.args.workers
+        print(f"model stage (OpenRouter): extract={llm.EXTRACT_MODEL} reason={llm.REASON_MODEL}")
+        with transaction(db):
+            self.capture_history()
+            st = ctx.store = Store(db)
+            ctx.regen = set()
+            failed_n = 0
+
+            # A. code pass (any language): its endpoints/calls feed the cross-source checks
+            pending = self.model_pending()
+            todo = {u: v for u, v in self.model_units().items() if u in pending and v[1] == "code"}
+            st.step = CODE_PASS_STEP
+            ok, failed = enrich.code_pass(ctx, workers, [s for s, _ in todo.values()])
+            st.finish()
+            for path in ok:
+                st.mark(f"{CODE_UNIT}{path}", "model", snap.head, sigs["code"], path=path,
+                        blob=ctx.sources[path].blob, context=self.code_context())
+            for path in failed:
+                st.drop(f"{CODE_UNIT}{path}")
+            failed_n += len(failed)
+            if self.args.show_unresolved:
+                for path, hint in sorted(set(ctx.unresolved)):
+                    print(f"    unresolved call target {hint!r} in {path}")
+            code_changed = st.mutations
+            if code_changed:  # same checks as a full run that had these code-pass results
+                det_units = [u for u in self.units() if u.startswith("det:") and u != DERIVED]
+                self.run_steps(det_units + self.code_units(), derived=True)
+                st.finish()
+                st.mark(DERIVED, "deterministic", snap.head, det_signature())
+            st.materialize()
+            enriched = len(ok)
+
+            # B. prose and diagrams (their prompt carries the component catalog)
+            pending = self.model_pending()
+            todo = {u: v for u, v in self.model_units().items() if u in pending and v[1] != "code"}
+            for s, _ in todo.values():
+                self.reset_model_columns(st, s)
+            catalog = enrich.catalog_text(ctx)
+            ok, failed = enrich.extract_prose(ctx, catalog, workers, [s for s, k in todo.values() if k == "prose"])
+            ok2, failed2 = enrich.read_diagrams(ctx, catalog, workers, [s for s, k in todo.values() if k == "diagram"])
+            st.finish()
+            for path in ok + ok2:
+                s, kind = todo[f"llm:{path}"]
+                st.mark(f"llm:{path}", "model", snap.head, sigs[kind], path=path, blob=s.blob, context=digest(catalog))
+            for path in failed + failed2:
+                st.drop(f"llm:{path}")
+                self.reset_model_columns(st, ctx.sources[path])
+            st.materialize()
+            enriched += len(ok) + len(ok2)
+            failed_n += len(failed) + len(failed2)
+
+            # C. diagram-vs-code comparison and verification
+            changed = st.mutations
+            if changed or DIAGRAM_CHECK in pending:
+                self.check_diagrams(st)
+            verify_failed = 0
+            rerun = bool(changed) or VERIFY in pending
+            if rerun:
+                self.db.execute("UPDATE conflict SET verdict = NULL, rationale = NULL, confidence = base_confidence "
+                                "WHERE verdict IN ('confirmed', 'rejected')")
+                st.use(VERIFY)
+                verify_failed = enrich.verify(ctx, workers)
+                st.finish()
+                st.mark(VERIFY, "model", snap.head, sigs["verify"], status="partial" if verify_failed else "complete")
+            st.materialize()
+            self.publish_checks()
+            failures = (f"{failed_n} files and {verify_failed} verification jobs failed"
+                        if failed_n or verify_failed else None)
+            self.update_model_stage(failures)
+            self.record_run()
+        reused = len(self.model_units()) - enriched - failed_n
+        self.note("model", f"{enriched} files enriched, {reused} reused, {failed_n} failed; "
+                           f"cross-source checks {'recomputed' if code_changed else 'unchanged'}; "
+                           f"verification {'re-run' if rerun else 'reused'}"
+                           + (f" ({verify_failed} failed)" if verify_failed else "")
+                           + "; " + self.record_line(st.stats, ("model",)))
+        return EXIT_INCOMPLETE if failures else 0
+
+    # -- history -------------------------------------------------------------------
+    def capture_history(self):
+        """Active findings and last run before this invocation's first write (the comparison baseline)."""
+        if self.history is not None:
+            return
+        db = self.db
+        tables = _tables(db)
+        before = last = None
+        if "run" in tables and "fingerprint" in _columns(db, "conflict") and "fingerprint" in _columns(db, "risk"):
+            last = db.execute("SELECT * FROM run ORDER BY id DESC LIMIT 1").fetchone()
+            before = active_findings(db)
+        self.history = (before, last)
+
+    def record_run(self):
+        """One run row per invocation; compared only with a run of the same repo and model-stage state."""
+        db = self.db
+        before, last = self.history
+        fingerprint_findings(db)
+        now = active_findings(db)
+        model = self.stage("model")
+        complete = bool(model and model["status"] == "complete")
+        comparable = bool(before is not None and last and last[1] == self.label and bool(last[4]) == complete)
+        new = {fp: v for fp, v in now.items() if comparable and fp not in before}
+        resolved = {fp: v for fp, v in (before.items() if comparable else []) if fp not in now}
+        n_conf = sum(1 for v in now.values() if v[0] == "conflict")
+        row = (self.label, self.snap.head[:7], datetime.now().isoformat(timespec="seconds"), int(complete), n_conf,
+               len(now) - n_conf, len(new), len(resolved), last[0] if comparable else None)
+        if self.run_id is None:
+            self.run_id = db.execute("INSERT INTO run (repo, commit_sha, finished, llm, conflicts, risks, new, "
+                                     "resolved, baseline_run) VALUES (?,?,?,?,?,?,?,?,?)", row).lastrowid
+        else:
+            db.execute("UPDATE run SET repo = ?, commit_sha = ?, finished = ?, llm = ?, conflicts = ?, risks = ?, "
+                       "new = ?, resolved = ?, baseline_run = ? WHERE id = ?", (*row, self.run_id))
+        db.execute("DELETE FROM change WHERE run_id = ?", (self.run_id,))
+        db.executemany("INSERT INTO change VALUES (?,?,?,?,?,?)",
+                       [(self.run_id, v[0], "new", fp, v[1], v[2]) for fp, v in new.items()] +
+                       [(self.run_id, v[0], "resolved", fp, v[1], None) for fp, v in resolved.items()])
+        self.diff = {"run": self.run_id, "baseline": last if comparable else None, "had_previous": bool(last),
+                     "new": new, "resolved": resolved}
+
+    # -- publication ---------------------------------------------------------------
+    def publish_checks(self):
+        problems = integrity_problems(self.db)
+        if problems:
+            raise IngestError("integrity check failed, nothing was published: " + "; ".join(problems))
+
+    @staticmethod
+    def record_line(stats: Counter, groups) -> str:
+        parts = []
+        for g in groups:
+            a, r, k = stats[g, "added"], stats[g, "removed"], stats[g, "kept"]
+            label = {"file": "file-local", "derived": "cross-source", "model": "model"}[g]
+            parts.append(f"{label} records +{a} -{r} ={k}")
+        return ", ".join(parts)
+
+    def stage_line(self) -> str:
+        out = []
+        for name in ("deterministic", "model"):
+            st = self.stage(name)
+            if not st:
+                out.append(f"{name} never run")
+                continue
+            out.append(f"{name} {st['status']} @{short(st['commit'])}" + (f" ({st['detail']})" if st["detail"] else ""))
+        return "; ".join(out)
+
+    def print_summary(self):
+        snap, db = self.snap, self.db
+        print(f"{'source repo':<13}: {snap.repo}" + (f"  (origin {snap.remote})" if snap.remote else ""))
+        print(f"{'database':<13}: {self.args.db}")
+        for label, text in self.lines:
+            print(f"{label:<13}: {text}")
+        if schema_state(db) != "current":
+            return
+        print(f"{'components':<13}: " + ", ".join(f"{k} {n}" for k, n in db.execute(
+            "SELECT kind, COUNT(*) FROM component WHERE id LIKE 'comp:%' GROUP BY kind")))
+        counts = ", ".join(f"{t} {db.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]}"
+                           for t in ("source", "component", "relation", "evidence", "claim", "conflict", "risk"))
+        print(f"{'totals':<13}: {counts}")
+        if self.args.stats:
+            print("files by kind:")
+            for kind, n in db.execute("SELECT kind, COUNT(*) FROM source GROUP BY kind ORDER BY 2 DESC"):
+                print(f"  {kind:<20}{n}")
+            print("conflicts by check:")
+            for chk, v, n in db.execute("SELECT check_name, IFNULL(verdict, '-'), COUNT(*) FROM conflict "
+                                        "GROUP BY 1, 2 ORDER BY 3 DESC"):
+                print(f"  {chk:<32}{v:<11}{n}")
+            print("risks by rule:")
+            for rule, sev, n in db.execute("SELECT rule, severity, COUNT(*) FROM risk GROUP BY 1,2 ORDER BY 3 DESC"):
+                print(f"  {rule:<32}{sev:<8}{n}")
+        if self.diff:
+            print_diff(self.diff, short(snap.head))
 
 
 def print_diff(diff: dict, commit: str):
     base = diff["baseline"]
     print(f"\nrun #{diff['run']} at {commit}", end="")
     if not base:
-        print(" - no comparable previous run" + (" (different repo or LLM mode)" if diff["had_previous"] else "")
-              + "; this run is the new baseline")
+        print(" - no comparable previous run" + (" (different repo or model-stage state)" if diff["had_previous"]
+                                                 else "") + "; this run is the new baseline")
         return
     print(f", compared with run #{base[0]} at {base[2]} ({base[3]}):")
     for change, items in (("NEW", diff["new"]), ("RESOLVED", diff["resolved"])):
         conf = sum(1 for v in items.values() if v[0] == "conflict")
         print(f"  {change:<9} {conf} conflicts, {len(items) - conf} risks")
-        for item, summary, _ in sorted(items.values())[:10]:
+        for item, summary, _ in sorted(items.values(), key=lambda v: (v[0], v[1]))[:10]:
             print(f"    {'+' if change == 'NEW' else '-'} {item}: {summary[:150]}")
         if len(items) > 10:
             print(f"    ... {len(items) - 10} more (python3 query.py changes)")
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo-url", default=DEFAULT_REPO_URL)
+    ap.add_argument("--repo", type=Path, help="existing local checkout (read-only, must have no tracked changes)")
+    ap.add_argument("--db", type=Path, default=HERE / "context.db")
+    ap.add_argument("--no-llm", action="store_true", help="skip the OpenRouter stages")
+    ap.add_argument("--workers", type=int, default=8, help="parallel LLM requests")
+    ap.add_argument("--show-unresolved", action="store_true", help="list call targets no component matched")
+    ap.add_argument("--label", help="name of the source for run-to-run comparison (default: repo url/path)")
+    ap.add_argument("--stats", action="store_true", help="also print per-kind/check/rule breakdowns")
+    return ap.parse_args(argv)
+
+
+def run(argv=None) -> int:
+    """0 = requested stages complete, 1 = error (database untouched), 3 = model stage incomplete."""
+    args = parse_args(argv)
+    if yaml is None:
+        print("warning: PyYAML not installed - compose/Kubernetes/YAML specs are skipped (pip install pyyaml)")
+    try:
+        repo = gitsnap.toplevel(prepare_repo(args.repo_url, args.repo))
+        dirty = gitsnap.dirty_tracked(repo)
+        if dirty:
+            listing = ", ".join(d.strip() for d in dirty[:5]) + (", ..." if len(dirty) > 5 else "")
+            raise IngestError(
+                f"{repo} has uncommitted changes to tracked files ({listing}). The database records a "
+                "commit, so only committed content can be ingested: commit or stash them (git stash), or use "
+                "a clean clone. Untracked files are ignored. The database was not modified.")
+        snap = gitsnap.snapshot(repo)
+    except (IngestError, gitsnap.GitError, subprocess.CalledProcessError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    name = (args.repo.name if args.repo else args.repo_url.rstrip("/").split("/")[-1]).removesuffix(".git").lower()
+    label = args.label or (str(args.repo.resolve()) if args.repo else args.repo_url)
+    created = not args.db.exists()
+    db = sqlite3.connect(args.db, isolation_level=None, timeout=30)
+    ing = Ingestion(db, snap, args, name, label)
+    try:
+        code = ing.run()
+        ing.print_summary()
+        return code
+    except IngestError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except sqlite3.OperationalError as e:
+        if "locked" not in str(e):
+            raise
+        print(f"error: {args.db} is locked by another ingestion; nothing was changed ({e})", file=sys.stderr)
+        return 1
+    finally:
+        db.close()
+        if created and not ing.published:  # never leave an empty, half-created database behind
+            for suffix in ("", "-wal", "-shm"):
+                Path(str(args.db) + suffix).unlink(missing_ok=True)
+
+
+def main():
+    return run()
 
 
 if __name__ == "__main__":

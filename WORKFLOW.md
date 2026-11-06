@@ -2,7 +2,9 @@
 
 One command, `python3 ingest.py`, turns the engineering repository
 [arkik7/att-hackathon-task](https://github.com/arkik7/att-hackathon-task) into one SQLite
-knowledge base, `context.db`. The source repository is only cloned and read, never modified.
+knowledge base, `context.db`, and keeps it up to date commit by commit (see
+[Keeping context.db up to date](#keeping-contextdb-up-to-date)). The source repository is only
+cloned and read, never modified.
 Questions are then answered from that database. Every answer gives a **claim + source
 (file:line) + confidence**.
 
@@ -40,8 +42,10 @@ Requirements: Python 3.10+, git and PyYAML (`pip install "pyyaml>=6"`, see READM
 ## Stage 1: deterministic
 
 ### 1. Collect
-Any git repository is cloned into `.cache/sources/<repo>`, or pulled if it is already there.
-For every file tracked by git, the pipeline stores its path, size, text and last commit date.
+Any git repository is cloned into `.cache/sources/<repo>`, or pulled if it is already there
+(`--repo` uses an existing checkout as is; it must have no uncommitted changes to tracked files).
+For every file tracked by git at HEAD, the pipeline stores its path, Git blob id, size, text
+(read from the Git object store, not the working tree) and last commit date.
 It also stores any date the file states about itself (`2026-03-10-api-review.md`,
 `Date: 2026-03-11`). Those dates later decide which of two conflicting sources is newer.
 
@@ -186,13 +190,17 @@ run #3 at 6b7bf93, compared with run #2 at 612cc0b (2026-11-06T11:43:00):
 - **Fingerprints.** Each conflict and risk gets a *fingerprint*: a hash of its type, its
   subject, and the file + quote of its evidence. Line numbers are deliberately left out, so
   inserting lines above a finding does not make it look new.
-- **Comparison.** Before the database is rebuilt, the old run's active fingerprints and run
-  history are read. After the run they are compared: fingerprints that appeared are *new*,
-  and ones that disappeared are *resolved*. Conflicts the verifier rejected don't count as active.
-- **Like with like.** Runs are compared only if they cover the same repository in the same mode
-  (rules-only vs. AI). Otherwise every AI finding would look "resolved" after a rules-only run.
-  A run with no comparable predecessor becomes the new baseline.
-- **History.** Run history is kept across rebuilds in the `run` and `change` tables.
+- **Comparison.** The database is updated in place: the active fingerprints are read at the
+  start of the update transaction and compared with the result at its end, so the diff and the
+  data it describes are published together. Fingerprints that appeared are *new*, and ones that
+  disappeared are *resolved*. Conflicts the verifier rejected don't count as active.
+- **Like with like.** Runs are compared only if they cover the same repository and the model
+  stage is in the same state (complete vs. not, see `stage_state`). Otherwise every AI finding
+  would look "resolved" after a rules-only run. A run with no comparable predecessor becomes the
+  new baseline.
+- **History.** One `run` row per invocation that changed the database (a run with nothing to do
+  writes nothing); `change` lists its new / resolved findings. History from databases built
+  before incremental ingest is kept by the migration.
 
 **Usage:**
 ```sh
@@ -211,15 +219,9 @@ python3 ingest.py --repo <checkout> --label <name>   # compare different checkou
 | added a hardcoded API key | **new** high risk, key masked in the quote |
 | inserted lines above existing findings | no change reported |
 
-**Limit:** rule-based findings are fully stable. AI findings are stable while their inputs are
-unchanged, because the response cache replays the same answers. When code changes, evidence
-row numbers shift and the verifier's prompts change even for components that didn't change.
-Its answers may then be worded differently and show up as false new/resolved churn. The
-planned fix is **stable evidence ids** (a hash of path + line + quote), which is also the core of
-incremental ingest:
-- redo per-file extraction only for changed files
-- recompute the global assembly every time (cheap)
-- re-verify only the components whose inputs changed
+Rule-based findings are fully stable. AI findings are stable while their inputs are unchanged:
+with incremental ingest, rows of unchanged files keep their ids, so the verifier's prompts for
+components that did not change are byte-identical and the response cache replays the same answers.
 
 ## Design rules
 
@@ -262,8 +264,12 @@ that issue describes the rename itself, so it isn't stale.
 | `claim` | what each document asserts about a component |
 | `conflict` | conflict / gap / stale, with evidence, verifier verdict and rationale |
 | `risk` | security concern, severity, guidance for generated code |
-| `run` | one row per ingest: commit, mode, counts, baseline run |
+| `run` | one row per ingest that changed the database: commit, mode, counts, baseline run |
 | `change` | findings new / resolved in each run compared with its baseline |
+| `stage_state` | commit the data represents, extraction signature and completion per stage |
+| `extraction_unit` | per unit (file or cross-source step): blob id, signature and context it was built from |
+| `unit_fact`, `component_decl` | stored extraction context and component declarations per unit |
+| `ingest_meta` | repository identity (root commit, remote URL without credentials) |
 
 Open it with DB Browser for SQLite: `sqlitebrowser context.db`.
 
@@ -287,7 +293,13 @@ The main pipeline. It defines the schema and runs the deterministic stage:
 - the `check_*` cross-checks and the security `RULES`
 
 When a key is available it calls the AI stages in `enrich.py`, then prints a summary.
-Options: `--repo-url`, `--repo`, `--db`, `--no-llm`, `--workers`, `--show-unresolved`.
+Options: `--repo-url`, `--repo`, `--db`, `--no-llm`, `--workers`, `--show-unresolved`, `--label`,
+`--stats`. Exit code 0 = requested stages complete, 1 = error (database unchanged), 3 = model
+stage requested but incomplete (deterministic results are published).
+
+### `gitsnap.py`: read-only Git access
+Repository identity (root commit), HEAD, tracked files with blob ids (`ls-tree`), blob contents
+(`cat-file --batch`), commit diffs and the clean-checkout check. It never writes to the checkout.
 
 ### `enrich.py`: the AI part of the ingest
 Called by `ingest.py`:
@@ -323,7 +335,7 @@ It answers as claim, `path:line`, confidence, with a *Watch out* section. Afterw
 `check_citations()` flags any cited file that is not in the repository.
 
 ### Generated files (git-ignored)
-- `context.db`: the knowledge base, rebuilt on every ingest.
+- `context.db` (+ `-wal`/`-shm` while open): the knowledge base, updated in place per commit.
 - `.cache/sources/<repo>/`: read-only clones of the source repositories.
 - `.cache/llm/`: cached AI responses.
 - `.env`: the OpenRouter key.
@@ -357,7 +369,94 @@ generic weaknesses, and all of them were fixed in the general code, not with rep
   - gRPC contracts (`.proto`) are stored and searchable, but not yet parsed into endpoints.
   - Diagram mapping depends on the vision model.
   - Claims are only verified if the prose step attached them to a component.
+  - Incremental ingest: see *Limitations* under [Keeping context.db up to date](#keeping-contextdb-up-to-date).
 - **Next steps:**
-  - An MCP server so IDEs (Claude Code, Cursor) can call `ask`, `impact` and the other tools directly.
-  - Stable evidence ids and per-file incremental ingest triggered on each commit (see
-    *Run-to-run diff* above).
+  - Run `ingest.py` from CI or a post-merge hook, so the database follows the default branch.
+  - Multiple repositories in one knowledge base, for cross-repo relationships.
+
+---
+
+## Keeping context.db up to date
+
+### Setup and update
+
+```sh
+python3 ingest.py --repo ../att-hackathon-task            # first run: full build
+git -C ../att-hackathon-task pull                         # ...the source moves on...
+python3 ingest.py --repo ../att-hackathon-task            # incremental update
+python3 ingest.py --repo ../att-hackathon-task --no-llm   # rules only; enrichment can follow later
+python3 -m unittest discover -s tests -v                  # tests (temporary repos, mocked model)
+```
+
+The input checkout must have no staged or unstaged changes to tracked files; otherwise ingest
+stops before touching the database and says what to commit or stash. Untracked files are not
+part of the corpus. Without `--repo`, a managed clone in `.cache/sources/<repo>` is pulled and used.
+
+### Provenance: commit and blob ids
+Git is the only identity system. `ingest_meta` stores the repository identity (root commit,
+plus the credential-free remote URL); a database built from another repository is refused.
+`stage_state` stores, per stage (`deterministic`, `model`), the commit the data represents, the
+extraction signature and whether the stage is complete. `source.blob` stores the Git blob id
+each file was read from. Every knowledge row carries `unit`: the extraction unit that produced
+it, and `extraction_unit` records the blob, signature and shared-context digest each unit was
+built from. So for any fact: evidence → file:line → blob id → commit.
+
+### What "incremental" means here
+| unit | what | re-run when |
+|---|---|---|
+| `det:<path>` | file-local rules: manifests, routes/calls/SQL, API specs, doc mentions, security rules | its blob changes, the extraction signature changes (`EXTRACTION_VERSION`, PyYAML availability), or the shared context it reads changes (components, aliases; ports for code and specs) |
+| `det:*` | cross-source results: component discovery, addresses, compose/Kubernetes, migration replay, CODEOWNERS, component kinds, all `check_*`, agent-instruction files | any input text changes or an LLM code unit changes (recomputed globally from the stored endpoint/call facts of unchanged files) |
+| `llm:code:<path>` | AI code pass for one file | its blob, model id or prompt changes, or the resolution context (components, aliases, ports, extraction signature) changes |
+| `llm:<path>` | prose and diagram extraction | its blob, model id, prompt text or the component catalog changes |
+| `llm:diagram-check` | diagram arrows vs observed call graph | knowledge changed (no model call: uses the stored diagram output) |
+| `llm:verify` | verifier verdicts + contradictions | anything it reviews changed |
+
+- Change detection is `git diff --name-status --no-renames <stored commit> HEAD` (renames are a
+  delete plus an add), cross-checked against the stored blob ids.
+- Unchanged files are not re-read by extractors; their rows stay untouched (same ids).
+- A re-extracted unit is matched against its previous rows by natural key: identical records keep
+  their id, vanished ones are deleted, new ones inserted. Repeated runs never duplicate rows.
+- De-duplication is per file: a file's results never depend on which other file reported the
+  same route or call first. The cross-source checks still see each key once, in full-run order,
+  so their results equal a full rebuild. The AI code pass skips what the rules already found in
+  the same file.
+- Components exist while at least one unit declares them (`component_decl`); a library used by a
+  deleted manifest disappears only if no other manifest uses it. The AI's document type refines
+  `source.kind`; the rule-based one stays in `source.det_kind`, which is what change detection uses.
+- A commit that changes only unprocessed files (lockfiles, binaries) just advances the snapshot.
+  The same commit, signature and completed stages: exit 0 with no writes.
+
+### Stages and invalidation
+`--no-llm` publishes the deterministic stage and records the model stage as `incomplete` with
+what is pending. A later normal run at the same HEAD performs only the missing enrichment
+(code pass first; when its results change, the cross-source checks are recomputed with them, as
+in a full run). Model results for changed or deleted files, or produced with another catalog or
+resolution context, are removed together with the source update (old model output is never shown
+next to a new snapshot); changing `EXTRACT_MODEL`, `REASON_MODEL` or a prompt re-runs exactly the
+affected units. Missing credentials or failed model calls are reported, the model stage stays
+`incomplete`, ingest exits with 3, and the next run retries only what is missing. Signatures
+contain model ids and prompt digests, never credentials.
+
+### Migration and failure behaviour
+- The schema is versioned (`PRAGMA user_version` = 2). Databases from before incremental ingest
+  (with or without fingerprints and run history) are migrated in place and get one full logical
+  refresh, in the same transaction; their run history is kept.
+- Two transactions, in WAL mode: (1) migration + deterministic update + removal of stale model
+  results + integrity check (no dangling evidence, component or source references; search index in
+  step with sources) + advancing the deterministic marker + run record; (2) enrichment + advancing
+  the model marker + run record. A crash or error rolls back the open transaction, so readers
+  (query.py, ask.py, the MCP server) see the previous or the new state. A newly created database is
+  deleted if its first build fails.
+
+### Limitations
+- The shared-context dependency is coarse: a port-registry change re-extracts every code and spec
+  file and re-runs the AI code pass for every code file (identical prompts, so the response cache
+  answers them), and any catalog change (new component, table or team) re-runs prose and diagram
+  extraction for every document, because the catalog is in the prompt.
+- Cross-source checks are recomputed globally whenever any input changes.
+- Verification is re-run as a whole after any knowledge change; unaffected components are cache
+  hits, but a removed cache means paying for them again.
+- Only the current snapshot is kept: no as-of queries, no dirty-tree ingestion, no rename tracking.
+- Bump `EXTRACTION_VERSION` (ingest.py) / `MODEL_STAGE_VERSION` (enrich.py) when changing extractor
+  or model-stage code; prompt text and model ids are tracked automatically.
+- Symlinks and submodules are not part of the corpus (only regular tracked files).

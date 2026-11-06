@@ -118,7 +118,8 @@ def chat_json(system: str, user: str | list, model: str, max_tokens: int = 4000)
     return json.loads(m.group(0))
 
 
-def image_part(path: Path) -> dict:
+def image_part(path: Path, data: bytes | None = None) -> dict:
+    """Image message part; `data` (e.g. a Git blob) is used instead of reading `path` when given."""
     mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
-    data = base64.b64encode(path.read_bytes()).decode()
+    data = base64.b64encode(path.read_bytes() if data is None else data).decode()
     return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}

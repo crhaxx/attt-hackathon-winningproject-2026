@@ -1,5 +1,7 @@
 .cache/
 context.db
+context.db-wal
+context.db-shm
 __pycache__/
 .env
 .venv/

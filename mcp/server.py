@@ -58,12 +58,17 @@ def _call(name: str, args: dict) -> str:
 
 @mcp.tool(structured_output=False)
 def status() -> str:
-    """Report whether context.db exists and how many sources, components, relations, conflicts and risks it holds."""
+    """Report whether context.db exists, which source commit it represents, whether model enrichment is complete, and how many sources, components, relations, conflicts and risks it holds."""
     if not query.DB.exists():
         return "context.db not found - run: python3 ingest.py"
     db = query.connect()
     try:
         lines = [f"database: {query.DB}"]
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name = 'stage_state'").fetchone():
+            # which source commit the answers describe, and whether model enrichment covers it
+            for r in db.execute("SELECT stage, commit_id, status, detail FROM stage_state ORDER BY stage"):
+                lines.append(f"{r['stage']} stage: {r['status']} at commit {(r['commit_id'] or '-')[:12]}"
+                             + (f" ({r['detail']})" if r["detail"] else ""))
         for table in ("source", "component", "relation", "evidence", "claim", "conflict", "risk"):
             n = db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             lines.append(f"{table}: {n}")
@@ -115,7 +120,7 @@ def read_source(path: str, start: int = 1, end: int = 0) -> str:
 
 @mcp.tool(structured_output=False)
 def sql(statement: str) -> str:
-    """Read-only SQL over context.db (80 rows max). Tables: source, component, relation, evidence, claim, conflict, risk."""
+    """Read-only SQL over context.db (80 rows max). Tables: source, component, relation, evidence, claim, conflict, risk, run, change, stage_state."""
     return _call("sql", {"query": statement})
 
 
