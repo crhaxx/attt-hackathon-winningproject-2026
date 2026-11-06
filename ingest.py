@@ -60,7 +60,7 @@ HERE = Path(__file__).resolve().parent
 
 # Bump when extractor, check, rule or classification code changes: every deterministic
 # result is then re-extracted (and model results re-checked) even if HEAD did not move.
-EXTRACTION_VERSION = "2026-11-06.2"
+EXTRACTION_VERSION = "2026-11-06.3"
 SCHEMA_VERSION = 2
 
 # --------------------------------------------------------------------------
@@ -1699,6 +1699,551 @@ def check_ownership(ctx: Ctx):
 
 
 # --------------------------------------------------------------------------
+# Package surface: npm export entrypoints, tsconfig presets, typecheck scripts.
+# Manifest parsing only recorded dependency pins, so a broken export, a preset
+# nobody extends, or a compiler script aimed at a different package never became
+# a finding.
+# --------------------------------------------------------------------------
+
+_EXPORT_CONDITIONS = {"import", "require", "default", "types", "node", "browser", "development", "production"}
+_NODE_BUILTINS = {
+    "assert", "async_hooks", "buffer", "child_process", "cluster", "console", "constants", "crypto",
+    "dgram", "dns", "domain", "events", "fs", "http", "http2", "https", "inspector", "module", "net",
+    "os", "path", "perf_hooks", "process", "punycode", "querystring", "readline", "repl", "stream",
+    "string_decoder", "sys", "timers", "tls", "trace_events", "tty", "url", "util", "v8", "vm", "wasi",
+    "worker_threads", "zlib",
+}
+_FRAMEWORKS = {"react": "react", "remix": "remix", "vite": "vite", "next": "next", "nextjs": "next",
+               "vue": "vue", "svelte": "svelte", "angular": "angular"}
+_SPEC_RE = re.compile(
+    r"""(?:^|[^\w$])(?:import|export)\s+(?:type\s+)?(?:[^'"]*?\sfrom\s+)?['"]([^'"]+)['"]"""
+    r"""|(?:^|[^\w$])require(?:\.resolve)?\(\s*['"]([^'"]+)['"]\s*\)"""
+    r"""|(?:^|[^\w$])import\(\s*['"]([^'"]+)['"]\s*\)""")
+_MAP_RESOLVE_RE = re.compile(r"\[(?P<body>[^\[\]]*)\]\s*\.map\(\s*require(?:\.resolve)?\s*\)", re.S)
+_COMPILER_RE = re.compile(r"\b(tsc6|tsgo|tsc)\b")
+_DEP_SECTIONS = ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies")
+
+
+def _loads_jsonc(text: str):
+    """JSON with // and /* */ comments and trailing commas, as tsconfig files use."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            out.append(c)
+            i += 1
+            while i < n:
+                out.append(text[i])
+                if text[i] == "\\":
+                    i += 1
+                    if i < n:
+                        out.append(text[i])
+                elif text[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            i = text.find("\n", i)
+            if i < 0:
+                break
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        out.append(c)
+        i += 1
+    raw = re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+    return json.loads(raw)
+
+
+def _rel_join(base: str, rel: str) -> str:
+    parts = [p for p in base.split("/") if p] if base else []
+    for p in rel.split("/"):
+        if p in ("", "."):
+            continue
+        if p == "..":
+            if parts:
+                parts.pop()
+        else:
+            parts.append(p)
+    return "/".join(parts)
+
+
+def _flatten_exports(node, subpath="."):
+    if isinstance(node, str):
+        yield subpath, node
+    elif isinstance(node, dict):
+        if any(str(k).startswith(".") for k in node):
+            for k, v in node.items():
+                yield from _flatten_exports(v, k)
+        else:
+            for v in node.values():
+                yield from _flatten_exports(v, subpath)
+
+
+def _export_key(key: str) -> str:
+    if key in {".", "./"}:
+        return "."
+    return key[2:] if key.startswith("./") else key
+
+
+def _specifier_package(spec: str) -> str | None:
+    if not spec or spec.startswith((".", "/", "node:", "#", "file:", "data:", "http:", "https:")):
+        return None
+    if spec.startswith("@"):
+        parts = spec.split("/")
+        return "/".join(parts[:2]) if len(parts) >= 2 else None
+    base = spec.split("/")[0]
+    return None if base in _NODE_BUILTINS else base
+
+
+def _import_key(spec: str, pkg: str) -> str | None:
+    if spec == pkg:
+        return "."
+    prefix = pkg + "/"
+    return spec[len(prefix):] if spec.startswith(prefix) else None
+
+
+def _js_specifiers(text: str) -> list[tuple[int, str]]:
+    found = []
+    for i, line in enumerate(text.splitlines(), 1):
+        for m in _SPEC_RE.finditer(line):
+            found.append((i, next(g for g in m.groups() if g)))
+    for m in _MAP_RESOLVE_RE.finditer(text):
+        body, start = m.group("body"), m.start("body")
+        for sm in re.finditer(r"""['"]([^'"]+)['"]""", body):
+            found.append((text.count("\n", 0, start + sm.start()) + 1, sm.group(1)))
+    return found
+
+
+def _export_bindings(text: str) -> tuple[set[str], bool, bool]:
+    names = set(re.findall(
+        r"(?m)^export\s+(?:async\s+)?(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)", text))
+    for block in re.findall(r"(?m)^export\s*\{([^}]+)\}", text):
+        for part in block.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            names.add(part.split(" as ")[-1].strip() if " as " in part else part.split()[0])
+    has_default = bool(re.search(r"(?m)^export\s+default\b", text))
+    return names, has_default, "module.exports" in text
+
+
+def _named_imports(line: str) -> tuple[set[str], bool]:
+    names = set()
+    m = re.search(r"import\s*\{([^}]+)\}", line)
+    if m:
+        for part in m.group(1).split(","):
+            part = part.strip()
+            if part:
+                names.add(re.split(r"\s+as\s+", part)[0].strip())
+    default = bool(re.match(r"import\s+[A-Za-z_$]", line.strip()))
+    return names, default
+
+
+def _frameworks(text: str) -> set[str]:
+    return {_FRAMEWORKS[t] for t in re.findall(r"[A-Za-z]+", text.lower()) if t in _FRAMEWORKS}
+
+
+def _comment_text(text: str) -> str:
+    return "\n".join(re.findall(r"/\*([\s\S]*?)\*/", text) + re.findall(r"(?m)^\s*//(.*)$", text))
+
+
+def _quote(s: Source, needle: str, fallback: int = 1) -> tuple[int, str]:
+    ln = line_of(s, needle) or fallback
+    return ln, s.lines[ln - 1] if 0 < ln <= len(s.lines) else needle
+
+
+def _ev(st, s: Source, needle: str, extractor: str, fallback: int = 1) -> int:
+    ln, quote = _quote(s, needle, fallback)
+    return st.evidence(s.path, ln, quote, extractor)
+
+
+def _declared(data: dict) -> dict[str, str]:
+    out = {}
+    for sec in _DEP_SECTIONS:
+        for name, ver in (data.get(sec) or {}).items():
+            out.setdefault(name, str(ver))
+    return out
+
+
+def _dir_of(path: str) -> str:
+    return path.rsplit("/", 1)[0] if "/" in path else ""
+
+
+def check_package_surface(ctx: Ctx):
+    _check_npm_exports(ctx)
+    _check_tsconfig(ctx)
+    _check_typecheck_scripts(ctx)
+
+
+def _check_npm_exports(ctx: Ctx):
+    """Entrypoints declared in package.json `exports`, checked against real importers."""
+    st = ctx.store
+    importers: list[tuple[Source, int, str]] = []
+    for s in ctx.sources.values():
+        if not s.text or s.kind in {"binary", "lockfile", "generated", "diagram"}:
+            continue
+        for ln, spec in _js_specifiers(s.text):
+            if _specifier_package(spec):
+                importers.append((s, ln, spec))
+
+    for manifest in ctx.sources.values():
+        if manifest.name != "package.json" or not manifest.text:
+            continue
+        directory = _dir_of(manifest.path)
+        cid = ctx.comp_dirs.get(directory)
+        if not cid:
+            continue
+        try:
+            data = json.loads(manifest.text)
+        except json.JSONDecodeError:
+            continue
+        exports = data.get("exports")
+        if not exports:
+            continue
+        pkg = data.get("name") or ctx.short(cid)
+        declared = _declared(data)
+        esm = data.get("type") == "module"
+        # one file per subpath: prefer a target that is actually in the repo
+        chosen: dict[str, tuple[str, Source]] = {}
+        for key, target in _flatten_exports(exports):
+            if not isinstance(target, str) or not target.startswith("."):
+                continue
+            rel = _rel_join(directory, target)
+            src = ctx.sources.get(rel)
+            if src and src.text and _export_key(key) not in chosen:
+                chosen[_export_key(key)] = (target, src)
+        shapes = {key: _export_bindings(src.text) for key, (_, src) in chosen.items()}
+        used_names: set[str] = set()
+        for s, ln, spec in importers:
+            if _dir_of(s.path) == directory:
+                continue
+            if _import_key(spec, pkg) is None:
+                continue
+            names, _ = _named_imports(s.lines[ln - 1] if 0 < ln <= len(s.lines) else "")
+            used_names |= names
+        for key, (target, src) in chosen.items():
+            if key == ".":
+                continue
+            external = [(s, ln, spec) for s, ln, spec in importers
+                        if _import_key(spec, pkg) == key and _dir_of(s.path) != directory]
+            if external:
+                continue
+            names, has_default, cjs = shapes[key]
+            defects, evs = [], []
+            evs.append(_ev(st, manifest, f'"{target}"', "package-surface"))
+            if esm and (cjs or re.search(r"\brequire\s*\(", src.text)) and not re.search(
+                    r"(?m)^\s*(import|export)\s", src.text):
+                defects.append(f"{src.name} is CommonJS (require / module.exports) inside an ESM package "
+                               '("type": "module")')
+                if re.search(r"\brequire\s*\(", src.text):
+                    evs.append(_ev(st, src, "require(", "package-surface"))
+                if "module.exports" in src.text:
+                    evs.append(_ev(st, src, "module.exports", "package-surface"))
+                evs.append(_ev(st, manifest, '"type"', "package-surface"))
+            missing = []
+            for ln, spec in _js_specifiers(src.text):
+                dep = _specifier_package(spec)
+                if dep and dep not in declared and dep != pkg and dep not in missing:
+                    missing.append(dep)
+                    evs.append(st.evidence(src.path, ln, src.lines[ln - 1], "package-surface"))
+            if missing:
+                defects.append("it imports " + ", ".join(missing)
+                               + ", which is not in dependencies, devDependencies or peerDependencies")
+            comments = _frameworks(_comment_text(src.text))
+            export_fw = _FRAMEWORKS.get(key.split("/")[-1])
+            if export_fw and comments and export_fw not in comments:
+                named = ", ".join(sorted(comments))
+                defects.append(f"a comment in the file talks about {named}, not {export_fw}")
+                for i, line in enumerate(src.lines, 1):
+                    if (_frameworks(line) & comments) and (
+                            "/*" in line or line.strip().startswith("*") or "//" in line):
+                        evs.append(st.evidence(src.path, i, line, "package-surface"))
+                        break
+            sibling_files = []
+            for other_key, (other_ns, _, _) in shapes.items():
+                if other_key != key and used_names and used_names <= other_ns:
+                    sibling_files.append(chosen[other_key][1].name)
+            if used_names and not (used_names <= names):
+                how = "assigns module.exports" if cjs and not names else (
+                    "exports default" if has_default else "does not export " + ", ".join(sorted(used_names)))
+                via = ", ".join(sibling_files) if sibling_files else "other entrypoints"
+                defects.append(f"consumers import {{{', '.join(sorted(used_names))}}} from {via}; "
+                               f"this file {how}")
+                if has_default:
+                    evs.append(_ev(st, src, "export default", "package-surface"))
+                for sib in sibling_files[:1]:
+                    sib_src = next(s for _, s in chosen.values() if s.name == sib)
+                    evs.append(_ev(st, sib_src, "export const", "package-surface"))
+            if not defects:
+                defects.append("nothing in the repository imports it")
+            else:
+                defects.insert(0, "nothing in the repository imports it")
+            shown = key if key.startswith(".") else f"./{key}"
+            st.conflict(
+                "stale", "unused-package-export", f"{ctx.short(cid)} {shown}",
+                f"{pkg} exports {shown} ({src.path}), but " + "; ".join(defects) + ".",
+                0.9, evs)
+
+
+def _tsconfig_targets(data: dict) -> list[str]:
+    vals = []
+    ext = data.get("extends")
+    if isinstance(ext, str):
+        vals.append(ext)
+    elif isinstance(ext, list):
+        vals.extend(v for v in ext if isinstance(v, str))
+    for ref in data.get("references") or []:
+        if isinstance(ref, dict) and isinstance(ref.get("path"), str):
+            vals.append(ref["path"])
+    return vals
+
+
+def _parse_config_json(s: Source) -> dict | None:
+    if not s.text or not s.name.endswith(".json"):
+        return None
+    try:
+        data = _loads_jsonc(s.text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not any(k in data for k in ("compilerOptions", "extends", "references")):
+        return None
+    return data
+
+
+def _check_tsconfig(ctx: Ctx):
+    st = ctx.store
+    configs = []
+    for s in ctx.sources.values():
+        data = _parse_config_json(s)
+        if data is not None:
+            configs.append((s, data))
+    referenced: set[str] = set()
+    missing: list[tuple[Source, str, str]] = []
+    for s, data in configs:
+        base = _dir_of(s.path)
+        for raw in _tsconfig_targets(data):
+            if not raw.startswith("."):
+                continue
+            rel = _rel_join(base, raw)
+            if rel in ctx.sources or (rel + ".json") in ctx.sources:
+                referenced.add(rel if rel in ctx.sources else rel + ".json")
+            else:
+                missing.append((s, raw, rel))
+    for s, raw, rel in missing:
+        cid = ctx.owner(s.path)
+        directory = _dir_of(s.path)
+        manifest = ctx.sources.get(f"{directory}/package.json" if directory else "package.json")
+        pkg = None
+        if manifest and manifest.text:
+            try:
+                pkg = json.loads(manifest.text).get("name")
+            except json.JSONDecodeError:
+                pkg = None
+        ev = _ev(st, s, raw, "package-surface")
+        where = f"{s.path} ({pkg})" if pkg else s.path
+        st.conflict(
+            "conflict", "tsconfig-missing-file", f"{ctx.short(cid) if cid else s.path} {s.name}",
+            f"{where} points at {raw}, and {rel} is not in the repository.",
+            0.95, [ev])
+
+    # Shareable presets are JSON configs sitting next to a package.json, other than
+    # the project's own tsconfig*.json. A preset is used when something extends it.
+    presets = []  # (source, package name, component id)
+    for s, data in configs:
+        directory = _dir_of(s.path)
+        manifest = ctx.sources.get(f"{directory}/package.json" if directory else "package.json")
+        if not manifest or not manifest.text or s.name.startswith("tsconfig") or s.name == "package.json":
+            continue
+        if "compilerOptions" not in data:
+            continue  # turbo.json also has "extends", and it is not a tsconfig preset
+        try:
+            pkg = json.loads(manifest.text).get("name")
+        except json.JSONDecodeError:
+            pkg = None
+        cid = ctx.comp_dirs.get(directory)
+        if pkg and cid:
+            presets.append((s, pkg, cid))
+    for s, pkg, cid in presets:
+        if s.path in referenced:
+            continue
+        needle = f"{pkg}/{s.name}"
+        if any(other.text and needle in other.text and _dir_of(other.path) != _dir_of(s.path)
+               for other in ctx.sources.values()):
+            continue
+        ev = _ev(st, s, '"compilerOptions"' if '"compilerOptions"' in (s.text or "") else '"extends"',
+                 "package-surface")
+        st.conflict(
+            "stale", "unused-tsconfig-preset", f"{ctx.short(cid)} {s.name}",
+            f"{s.path} is a TypeScript preset of {pkg}, and no config extends it.",
+            0.85, [ev])
+
+    # The preset package other projects actually extend, if there is a clear one.
+    popularity: dict[str, int] = {}
+    for s, pkg, cid in presets:
+        needle = f"{pkg}/"
+        popularity[pkg] = sum(1 for other in ctx.sources.values()
+                              if other.text and needle in other.text and _dir_of(other.path) != _dir_of(s.path)
+                              and other.name.startswith("tsconfig"))
+    if not popularity:
+        return
+    shared = max(popularity, key=popularity.get)
+    if popularity[shared] < 2:
+        return
+    shared_cid = next(cid for _, pkg, cid in presets if pkg == shared)
+    shared_dir = next(d for d, c in ctx.comp_dirs.items() if c == shared_cid)
+    example = next((other for other in ctx.sources.values()
+                    if other.text and f"{shared}/" in other.text and other.name.startswith("tsconfig")
+                    and _dir_of(other.path) != shared_dir), None)
+    for directory, cid in ctx.comp_dirs.items():
+        if directory == shared_dir:
+            continue
+        ts = ctx.sources.get(f"{directory}/tsconfig.json" if directory else "tsconfig.json")
+        if not ts or not ts.text:
+            continue
+        try:
+            data = _loads_jsonc(ts.text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict) or data.get("extends"):
+            continue
+        manifest = ctx.sources.get(f"{directory}/package.json" if directory else "package.json")
+        declared = {}
+        if manifest and manifest.text:
+            try:
+                declared = _declared(json.loads(manifest.text))
+            except json.JSONDecodeError:
+                declared = {}
+        evs = [_ev(st, ts, '"compilerOptions"' if '"compilerOptions"' in ts.text else "{", "package-surface")]
+        if example:
+            evs.append(_ev(st, example, shared, "package-surface"))
+        if shared in declared:
+            evs.append(_ev(st, manifest, f'"{shared}"', "package-surface"))
+            st.conflict(
+                "gap", "tsconfig-ignores-shared", ctx.short(cid),
+                f"{ctx.short(cid)} depends on {shared}, but {ts.path} does not extend it and inlines its own "
+                f"compilerOptions. Other projects extend {shared}.",
+                0.9, evs)
+        else:
+            uses_ts = ("typescript" in declared or any(n.startswith("@typescript/") for n in declared)
+                       or (manifest is not None and manifest.text is not None and _COMPILER_RE.search(manifest.text)))
+            if not uses_ts:
+                continue
+            st.conflict(
+                "gap", "tsconfig-not-shared", ctx.short(cid),
+                f"{ts.path} is a standalone TypeScript config. {ctx.short(cid)} does not depend on {shared}, "
+                f"which other projects extend.",
+                0.85, evs)
+
+
+def _check_typecheck_scripts(ctx: Ctx):
+    """A project whose typecheck script calls a different binary than the rest.
+
+    The package named `typescript` and packages under `@typescript/` are reported
+    separately, so an old `tsc` pin is not described as the whole toolchain.
+    """
+    st = ctx.store
+    rows = []
+    for directory, cid in ctx.comp_dirs.items():
+        manifest = ctx.sources.get(f"{directory}/package.json" if directory else "package.json")
+        if not manifest or not manifest.text:
+            continue
+        try:
+            data = json.loads(manifest.text)
+        except json.JSONDecodeError:
+            continue
+        scripts = data.get("scripts") or {}
+        if not isinstance(scripts, dict):
+            continue
+        ordered = [k for k in ("check-types", "typecheck", "tsc") if k in scripts]
+        ordered += [k for k in scripts if k not in ordered]
+        found = None
+        for name in ordered:
+            m = _COMPILER_RE.search(str(scripts[name]))
+            if m:
+                found = (name, m.group(1), str(scripts[name]))
+                break
+        if not found:
+            continue
+        declared = _declared(data)
+        rows.append({
+            "cid": cid, "manifest": manifest, "script": found[0], "bin": found[1], "cmd": found[2],
+            "typescript": declared.get("typescript"),
+            "related": {k: v for k, v in declared.items()
+                        if k == "typescript" or k.startswith("@typescript/") or "typescript" in v},
+        })
+    if len(rows) < 2:
+        return
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["bin"]] = counts.get(row["bin"], 0) + 1
+    majority = max(counts, key=counts.get)
+    if counts[majority] < 2:
+        return
+    majority_ts = {r["typescript"] for r in rows if r["bin"] == majority and r["typescript"]}
+    for row in rows:
+        if row["bin"] == majority:
+            continue
+        evs = [_ev(st, row["manifest"], row["cmd"], "package-surface")]
+        if row["typescript"]:
+            evs.append(_ev(st, row["manifest"], f'"typescript": "{row["typescript"]}"', "package-surface"))
+        parts = [f"{ctx.short(row['cid'])} {row['script']} runs `{row['bin']}`"]
+        if row["typescript"]:
+            parts[0] += f" from the package named typescript ({row['typescript']})"
+        others = [r for r in rows if r["bin"] == majority]
+        parts.append(f"{len(others)} other TypeScript projects run `{majority}`")
+        if len(majority_ts) == 1:
+            ver = next(iter(majority_ts))
+            sample = next(r for r in others if r["typescript"] == ver)
+            evs.append(_ev(st, sample["manifest"], sample["cmd"], "package-surface"))
+            evs.append(_ev(st, sample["manifest"], f'"typescript": "{ver}"', "package-surface"))
+            parts.append(f"Their typescript dependency is {ver}")
+        # Companion @typescript/* pins, including projects that do not run this script.
+        aligned = []
+        drifted = []
+        for name, ver in sorted(row["related"].items()):
+            if name == "typescript":
+                continue
+            holders = []
+            for directory, cid in ctx.comp_dirs.items():
+                if cid == row["cid"]:
+                    continue
+                other_manifest = ctx.sources.get(f"{directory}/package.json" if directory else "package.json")
+                if not other_manifest or not other_manifest.text:
+                    continue
+                try:
+                    other_declared = _declared(json.loads(other_manifest.text))
+                except json.JSONDecodeError:
+                    continue
+                if name not in other_declared:
+                    continue
+                if other_declared[name] == ver:
+                    holders.append((cid, other_manifest))
+                else:
+                    drifted.append(name)
+            if holders:
+                aligned.append((name, ver, holders))
+                evs.append(_ev(st, row["manifest"], f'"{name}"', "package-surface"))
+                for _, other_manifest in holders:
+                    evs.append(_ev(st, other_manifest, f'"{name}"', "package-surface"))
+        if aligned:
+            bits = [f"{name} {ver} (also in {', '.join(ctx.short(c) for c, _ in holders)})"
+                    for name, ver, holders in aligned]
+            parts.append("Aligned, not behind: " + "; ".join(bits))
+        if row["typescript"] and majority_ts and row["typescript"] not in majority_ts and not drifted:
+            parts.append("Only the package named typescript differs, not every TypeScript package in the project")
+        st.conflict(
+            "conflict", "typecheck-entrypoint", ctx.short(row["cid"]),
+            ". ".join(parts) + ".",
+            0.9, evs)
+
+
+# --------------------------------------------------------------------------
 # Security rules (generic patterns; the LLM code pass adds context-specific ones)
 # --------------------------------------------------------------------------
 
@@ -1815,7 +2360,7 @@ STEPS = [
     (extract_schemas, "derived"), (extract_owners, "derived"), (None, "code-pass"),
     (extract_docs, "local"), (finalize_components, "derived"), (check_endpoints, "derived"),
     (check_deploy_vs_code, "derived"), (check_schema_drift, "derived"), (check_ownership, "derived"),
-    (scan_agent_instructions, "derived"), (scan_security, "local"),
+    (check_package_surface, "derived"), (scan_agent_instructions, "derived"), (scan_security, "local"),
 ]
 CODE_PASS_STEP = 9
 # steps that build the shared context (components, aliases, ports) file-local extractors read
