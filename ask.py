@@ -34,10 +34,16 @@ Answer format (markdown):
 - Separate what is verified from what is only documented or assumed.
 - Always add a "Watch out" section when relevant: conflicts, stale docs, and security risks
   that generated code must not repeat.
-- If the tools do not contain the answer, say so. Never cite a file you did not see in a tool result."""
+- If the tools do not contain the answer, say so. Never cite a file you did not see in a tool result.
+- A document claim marked <intended> or <proposed> is a plan, not something that exists; <historical> is the past.
+  Never present them as implemented."""
 
 TOOLS = [
     ("search", "Full-text search over every file in the repository (FTS5 syntax).", {"text": "string"}),
+    ("context", "START HERE for a component: its implemented and documented relationships, governing decisions, "
+                "document claims (current/intended/proposed/historical), linked conflicts and risks, recorded gaps "
+                "and source passages, in one call. name may be an id, short name or a name documents use for it; "
+                "focus (optional) puts matching items first.", {"name": "string", "focus": "string"}),
     ("component", "All relations of a component (app, package, table...) with evidence.", {"name": "string"}),
     ("impact", "What is affected if this component changes: dependents (transitive), data, owner, "
                "docs to update, conflicts and security risks.", {"name": "string"}),
@@ -58,7 +64,7 @@ TOOLS = [
             "detail) = which source commit the data represents and whether model enrichment is complete.",
             {"query": "string"}),
 ]
-REQUIRED = {"search": ["text"], "component": ["name"], "impact": ["name"], "read_source": ["path"], "sql": ["query"]}
+REQUIRED = {"search": ["text"], "context": ["name"], "component": ["name"], "impact": ["name"], "read_source": ["path"], "sql": ["query"]}
 
 
 def tool_specs():

@@ -73,8 +73,16 @@ ambiguous and is never used to link anything.
 
 ### `claim`: what a document asserts
 `component, topic (api|schema|money|auth|deployment|dependency|ownership|ops|other), text, path,
-doc_date, doc_status, evidence_id`. Claims are **compared against observed facts** in the
+doc_date, doc_status, evidence_id, perspective`. Claims are **compared against observed facts** in the
 verification step. They are never treated as true just because they are written down.
+
+`perspective` is how the *sentence* presents the statement, because one page often mixes the present,
+plans and open ideas: `current` (how things are now), `intended` (agreed target or plan, e.g. "will use"),
+`proposed` (not decided, e.g. "has not reached a launch date"), `historical`, `reported` (incident or
+ticket observation), `unknown` (not stated, and every claim extracted before schema v3). A `current`
+sentence inside a superseded or historical document is stored as `historical`. Facts from prose carry the
+same value in `relation.props.perspective`; `impact` does not treat `intended`/`proposed` edges as
+dependencies, and `historical` ones are `outdated`.
 
 ### `conflict`: a problem between sources
 | `kind` | Meaning |
@@ -125,6 +133,7 @@ compared with the previous comparable run.
 | *supersedes* | decision → decision | `props.supersedes`, resolved by title at query time | declared |
 | `DIAGRAM_EDGE` | component → component | vision model over diagrams | declared |
 | `MENTIONED_IN` | component → source | alias match in docs | declared |
+| `KNOWN_AS` | component → source | prose: another name the document itself ties to the component (e.g. "Edge, the API gateway"); `props.alias`, quote-checked, rejected if the name already means another component | declared |
 | `AFFECTED_BY_INCIDENT`, `MIGRATES_TO`, `REPLACES`, `DEPRECATES`, `DECIDED_BY`, `SHARES_DATA_WITH` | component → component/concept | prose | declared / outdated |
 
 ---

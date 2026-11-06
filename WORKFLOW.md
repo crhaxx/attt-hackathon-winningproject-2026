@@ -149,6 +149,12 @@ list of known components, the model returns JSON with:
 - the document's status: current, historical, proposal or superseded
 - facts about relationships between components
 - concrete claims, e.g. "orders expose `total` in dollars"
+- for each fact and claim, its **perspective**: whether the sentence describes the present, a plan,
+  an undecided proposal, the past or a reported observation (one page often mixes them)
+- **aliases**: other names the document itself ties to a known component ("Edge, the API gateway").
+  Kept only with a verbatim quote containing the name, and never when the name already means another
+  component. They are used for lookups (`context("Edge")`) and to resolve that same document's facts,
+  never by other files' extraction, so results do not depend on processing order.
 - risks the document mentions
 
 Two safeguards:
@@ -330,8 +336,12 @@ another database (this also works for `ask.py`).
 
 ### `mcp/server.py`: the interface for IDE agents
 An MCP server (stdio, or HTTP with `--http`) that exposes the `query.py` functions as tools:
-`status`, `impact`, `component`, `conflicts`, `risks`, `decisions`, `changes`, `search`,
-`read_source` and `sql`. This is how Cursor / Claude Code use the Context Service. It is
+`status`, `context`, `impact`, `component`, `conflicts`, `risks`, `decisions`, `changes`, `search`,
+`read_source` and `sql`. `context(name)` is the one-call entry point: it assembles, without any model
+call, a component's relationships (implemented apart from documented and outdated), governing decisions,
+document claims with their perspective, linked findings with the basis of each link, recorded gaps, the
+snapshot/stage state and the cited source passages. It fits a size budget by dropping passages first, then
+shortening lists, and reports what it left out (JSON stays valid). `focus` only reorders; it never hides. This is how Cursor / Claude Code use the Context Service. It is
 read-only, opens `context.db` per call, and caps outputs for the agent's context window.
 Configured in `.cursor/mcp.json` and `.mcp.json`.
 
@@ -448,7 +458,8 @@ affected units. Missing credentials or failed model calls are reported, the mode
 contain model ids and prompt digests, never credentials.
 
 ### Migration and failure behaviour
-- The schema is versioned (`PRAGMA user_version` = 2). Databases from before incremental ingest
+- The schema is versioned (`PRAGMA user_version` = 3; v2 -> v3 adds `claim.perspective` in place,
+  without re-extraction; the deterministic extraction signature is unaffected). Databases from before incremental ingest
   (with or without fingerprints and run history) are migrated in place and get one full logical
   refresh, in the same transaction; their run history is kept.
 - Two transactions, in WAL mode: (1) migration + deterministic update + removal of stale model

@@ -65,7 +65,7 @@ What the agent gets back, for example from `risks("order-service")`:
     <- apps/order-service/src/index.ts:41
 ```
 
-**Tools:** `impact` · `component` · `conflicts` · `risks` · `decisions` · `changes` · `search` · `read_source` · `sql` · `status`
+**Tools:** `context` (start here: everything about one component, in one call) · `impact` · `component` · `conflicts` · `risks` · `decisions` · `changes` · `search` · `read_source` · `sql` · `status`
 
 ## How it works
 
@@ -105,7 +105,8 @@ It isn't tied to one repo: it was tested unchanged on
 ```sh
 python3 ingest.py --repo-url <git url> --db other.db   # any other repository
 python3 ingest.py --no-llm                             # rules only, free
-python3 query.py impact user-service                   # same queries as the MCP tools
+python3 query.py context inventory-service             # same queries as the MCP tools
+python3 query.py impact user-service
 python3 ask.py "question"                              # fallback agent without an IDE
 python3 -m unittest discover -s tests                  # tests (mocked model, no API calls)
 ```

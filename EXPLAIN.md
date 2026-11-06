@@ -245,7 +245,7 @@ Every answer comes **with its receipts**, so the assistant (and the engineer) ca
 the assistant writes code for a program, it's told to look up that program's risks and rules
 first, so it doesn't repeat known mistakes.
 
-<sub>⚙️ `mcp/server.py` is a read-only MCP server (stdio or HTTP). Its tools are `status`, `impact`,
+<sub>⚙️ `mcp/server.py` is a read-only MCP server (stdio or HTTP). Its tools are `status`, `context`, `impact`,
 `component`, `conflicts`, `risks`, `decisions`, `changes`, `search`, `read_source` and `sql`. It's configured
 for Cursor (`.cursor/mcp.json`) and Claude Code (`.mcp.json`), and outputs are capped for the agent's context
 window. `ask.py` is a command-line fallback agent with the same tools.</sub>

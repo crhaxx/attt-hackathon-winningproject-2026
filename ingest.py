@@ -61,7 +61,10 @@ HERE = Path(__file__).resolve().parent
 # Bump when extractor, check, rule or classification code changes: every deterministic
 # result is then re-extracted (and model results re-checked) even if HEAD did not move.
 EXTRACTION_VERSION = "2026-11-06.3"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+# Storage layout the deterministic records assume. Part of the extraction signature; it stays at 2
+# because v3 only adds a model-stage column, so upgrading does not re-run any extraction.
+DET_SCHEMA = 2
 
 # --------------------------------------------------------------------------
 # Ontology / storage
@@ -218,6 +221,11 @@ CREATE TABLE stage_state (       -- active snapshot per pipeline stage
 );
 """
 
+# Schema v3: how a document presents each claim (see enrich.PERSPECTIVES). NULL = not recorded.
+MIGRATION_V3 = """
+ALTER TABLE claim ADD COLUMN perspective TEXT;
+"""
+
 FTS_SCHEMA = "CREATE VIRTUAL TABLE source_fts USING fts5(path, kind, text)"
 
 DERIVED = "det:*"                    # cross-source deterministic results
@@ -230,7 +238,7 @@ KEYS = {
     "evidence": ("path", "line", "quote", "extractor"),
     "relation": ("src", "type", "dst", "status", "confidence", "evidence_id", "props"),
     "conflict": ("kind", "check_name", "subject", "description", "base_confidence", "evidence_ids"),
-    "claim": ("component", "topic", "text", "path", "doc_date", "doc_status", "evidence_id"),
+    "claim": ("component", "topic", "text", "path", "doc_date", "doc_status", "evidence_id", "perspective"),
     "risk": ("rule", "severity", "subject", "description", "guidance", "confidence", "evidence_id"),
 }
 RECORD_TABLES = ("relation", "claim", "risk", "conflict", "evidence")  # delete order
@@ -269,6 +277,8 @@ def schema_state(db: sqlite3.Connection) -> str:
     tables = _tables(db)
     if version == SCHEMA_VERSION:
         return "current"
+    if version == 2:
+        return "upgrade"
     if version > SCHEMA_VERSION:
         raise IngestError(f"database schema v{version} is newer than this ingest.py (v{SCHEMA_VERSION})")
     if version == 0 and not tables:
@@ -282,6 +292,7 @@ def create_schema(db: sqlite3.Connection):
     for stmt in _statements(SCHEMA + RUN_SCHEMA):
         db.execute(stmt)
     _upgrade_v2(db)
+    upgrade_v3(db)
 
 
 def migrate_legacy(db: sqlite3.Connection):
@@ -289,6 +300,7 @@ def migrate_legacy(db: sqlite3.Connection):
     removed and the caller performs a one-time full logical refresh inside the same transaction.
     Ingest history (run/change), when present, is kept."""
     _upgrade_v2(db)
+    upgrade_v3(db)
     for table in RECORD_TABLES + ("component",):
         db.execute(f"DELETE FROM {table}")
     db.execute("DELETE FROM source")
@@ -311,6 +323,12 @@ def _upgrade_v2(db: sqlite3.Connection):
             db.execute(FTS_SCHEMA)
         except sqlite3.OperationalError:
             pass  # no FTS5 in this SQLite build: query.py falls back to LIKE
+
+
+def upgrade_v3(db: sqlite3.Connection):
+    """v2 -> v3, in place: existing rows stay valid (their claims simply have no perspective)."""
+    for stmt in _statements(MIGRATION_V3):
+        db.execute(stmt)
     db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -539,8 +557,8 @@ class Store:
                                       json.dumps(sorted(set(evidence_ids)))),
                          {"confidence": confidence, "verdict": verdict})
 
-    def claim(self, component, topic, text, path, doc_date, doc_status, ev):
-        self._put("claim", (component, topic, text, path, doc_date, doc_status, ev))
+    def claim(self, component, topic, text, path, doc_date, doc_status, ev, perspective=None):
+        self._put("claim", (component, topic, text, path, doc_date, doc_status, ev, perspective))
 
     def risk(self, rule, severity, subject, description, guidance, confidence, ev):
         self._put("risk", (rule, severity, subject, description, guidance, confidence, ev))
@@ -2391,7 +2409,7 @@ def families(s: Source) -> list[str]:
 
 
 def det_signature() -> str:
-    return json.dumps({"extraction_version": EXTRACTION_VERSION, "schema": SCHEMA_VERSION,
+    return json.dumps({"extraction_version": EXTRACTION_VERSION, "schema": DET_SCHEMA,
                        "pyyaml": yaml is not None}, sort_keys=True)
 
 
@@ -2444,15 +2462,15 @@ class Ingestion:
         det_sig, model_sig = det_signature(), enrich.model_signature()
         want_model = not self.args.no_llm
         det_ok = False
-        if state == "current":
+        if state in ("current", "upgrade"):
             row = db.execute("SELECT value FROM ingest_meta WHERE key = 'repo_identity'").fetchone()
             if row and row[0] != snap.identity:
                 origin = db.execute("SELECT value FROM ingest_meta WHERE key = 'repo_remote'").fetchone()
                 raise IngestError(f"{self.args.db} was built from another repository "
                                   f"({origin[0] if origin and origin[0] else row[0]}); use a different --db")
             det, model = self.stage("deterministic"), self.stage("model")
-            det_ok = bool(det and det["status"] == "complete" and det["commit"] == snap.head
-                          and det["signature"] == det_sig)
+            det_ok = bool(state == "current" and det and det["status"] == "complete"
+                          and det["commit"] == snap.head and det["signature"] == det_sig)
             model_ok = bool(model and model["status"] == "complete" and model["commit"] == snap.head
                             and model["signature"] == model_sig)
             if det_ok and (model_ok or not want_model):
@@ -2523,7 +2541,10 @@ class Ingestion:
                 mode = "initial build"
             elif state == "legacy":
                 migrate_legacy(db)
-                mode = "legacy schema migrated to v2 (one-time full refresh)"
+                mode = f"legacy schema migrated to v{SCHEMA_VERSION} (one-time full refresh)"
+            elif state == "upgrade":
+                upgrade_v3(db)
+                mode = f"schema upgraded v2 -> v{SCHEMA_VERSION} in place (no re-extraction)"
             det = self.stage("deterministic")
             prev = det["commit"] if det else None
             if det and det["signature"] != det_sig:
