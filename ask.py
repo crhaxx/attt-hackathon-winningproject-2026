@@ -66,8 +66,12 @@ def tool_specs():
 
 def check_citations(db, answer: str) -> list[str]:
     bad = []
-    for path in set(re.findall(r"`([\w./@-]+\.[A-Za-z]\w*)(?::[\d,-]+)?`", answer)):
-        if not db.execute("SELECT 1 FROM source WHERE path = ?", (path,)).fetchone():
+    for path in set(re.findall(r"`([\w./@-]+\.[A-Za-z]\w*)(?::[\d,`:-]+)?`", answer)):
+        exact = db.execute("SELECT 1 FROM source WHERE path = ?", (path,)).fetchone()
+        # a short name like `ci.md` is fine when it is the end of a real path
+        suffix = exact or db.execute("SELECT 1 FROM source WHERE path LIKE ? ESCAPE '\\'",
+                                     ("%/" + path.replace("%", r"\%").replace("_", r"\_"),)).fetchone()
+        if not suffix:
             bad.append(path)
     return bad
 
