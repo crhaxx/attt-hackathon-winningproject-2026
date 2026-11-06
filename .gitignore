@@ -2,3 +2,5 @@
 context.db
 __pycache__/
 .env
+.venv/
+mcp/.vendor/

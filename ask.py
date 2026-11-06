@@ -11,8 +11,6 @@ file:line for every claim. Citations are checked against the database afterwards
 from __future__ import annotations
 
 import argparse
-import contextlib
-import io
 import json
 import re
 import sqlite3
@@ -66,44 +64,6 @@ def tool_specs():
                        "required": REQUIRED.get(name, [])}}} for name, desc, params in TOOLS]
 
 
-def run_tool(db, ro, name: str, args: dict) -> str:
-    buf = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buf):
-            if name == "search":
-                query.search(db, args["text"])
-            elif name in {"component", "impact"}:
-                getattr(query, name)(db, args["name"])
-            elif name == "conflicts":
-                query.conflicts(db, args.get("topic") or None)
-            elif name == "risks":
-                query.risks(db, args.get("target") or None)
-            elif name == "changes":
-                query.changes(db, args.get("run") or None)
-            elif name == "read_source":
-                row = db.execute("SELECT text FROM source WHERE path = ?", (args["path"],)).fetchone()
-                if not row or row[0] is None:
-                    print("no such text file")
-                else:
-                    lines = row[0].splitlines()
-                    a = max(int(args.get("start") or 1), 1)
-                    b = min(int(args.get("end") or a + 60), len(lines), a + 200)
-                    for i in range(a, b + 1):
-                        print(f"{i:>4}: {lines[i - 1]}")
-            elif name == "sql":
-                cur = ro.execute(args["query"])
-                cols = [d[0] for d in cur.description or []]
-                print(" | ".join(cols))
-                for row in cur.fetchmany(80):
-                    print(" | ".join(str(v)[:200] for v in row))
-    except SystemExit as e:
-        print(e)
-    except (sqlite3.Error, KeyError, ValueError) as e:
-        print(f"tool error: {e}")
-    out = buf.getvalue()
-    return out[:24000] + ("\n...(truncated)" if len(out) > 24000 else "") or "(no results)"
-
-
 def check_citations(db, answer: str) -> list[str]:
     bad = []
     for path in set(re.findall(r"`([\w./@-]+\.[A-Za-z]\w*)(?::[\d,-]+)?`", answer)):
@@ -134,7 +94,7 @@ def ask(question: str, show_tools: bool = False, max_steps: int = 10) -> str:
                 args = {}
             if show_tools:
                 print(f"  → {fn}({json.dumps(args)})", file=sys.stderr)
-            messages.append({"role": "tool", "tool_call_id": c["id"], "content": run_tool(db, ro, fn, args)})
+            messages.append({"role": "tool", "tool_call_id": c["id"], "content": query.run_tool(db, ro, fn, args)})
     return "Stopped: too many tool steps without a final answer."
 
 

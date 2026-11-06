@@ -13,6 +13,8 @@ Every answer line is: claim  [confidence]  <- source:line "quote"
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sqlite3
@@ -171,6 +173,47 @@ def changes(db, run: str | None = None):
             evs = json.loads(row["evidence_ids"]) if table == "conflict" else [row["evidence_id"]]
             for ev in evs[:3]:
                 print(f"      <- {cite(db, ev)}")
+
+
+def run_tool(db, ro, name: str, args: dict) -> str:
+    """Run one read-only tool. Shared by ask.py and the MCP server."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        try:
+            if name == "search":
+                search(db, args["text"])
+            elif name in {"component", "impact"}:
+                globals()[name](db, args["name"])
+            elif name == "conflicts":
+                conflicts(db, args.get("topic") or None)
+            elif name == "risks":
+                risks(db, args.get("target") or None)
+            elif name == "changes":
+                changes(db, args.get("run") or None)
+            elif name == "read_source":
+                row = db.execute("SELECT text FROM source WHERE path = ?", (args["path"],)).fetchone()
+                if not row or row[0] is None:
+                    print("no such text file")
+                else:
+                    lines = row[0].splitlines()
+                    a = max(int(args.get("start") or 1), 1)
+                    b = min(int(args.get("end") or a + 60), len(lines), a + 200)
+                    for i in range(a, b + 1):
+                        print(f"{i:>4}: {lines[i - 1]}")
+            elif name == "sql":
+                cur = ro.execute(args["query"])
+                cols = [d[0] for d in cur.description or []]
+                print(" | ".join(cols))
+                for row in cur.fetchmany(80):
+                    print(" | ".join(str(v)[:200] for v in row))
+            else:
+                print(f"unknown tool: {name}")
+        except SystemExit as e:
+            print(e.code if isinstance(e.code, str) and e.code else e)
+        except (sqlite3.Error, KeyError, ValueError) as e:
+            print(f"tool error: {e}")
+    out = buf.getvalue()
+    return out[:24000] + ("\n...(truncated)" if len(out) > 24000 else "") or "(no results)"
 
 
 def main():
