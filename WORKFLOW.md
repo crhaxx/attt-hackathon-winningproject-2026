@@ -32,7 +32,7 @@ python3 ingest.py --no-llm                          # deterministic stage only
 python3 ingest.py --show-unresolved                 # list call targets nobody matched
 ```
 
-Requirements: Python 3.10+, git and PyYAML (`pip install -r requirements.txt`; on NixOS
+Requirements: Python 3.10+, git and PyYAML (`pip install "pyyaml>=6"`, see README; on NixOS
 `nix-shell -p python3 python3Packages.pyyaml git`).
 
 ---
