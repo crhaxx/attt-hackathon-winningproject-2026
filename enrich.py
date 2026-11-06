@@ -86,11 +86,26 @@ Return ONE JSON object:
              "claim": "<what the document asserts, concrete: field names, endpoints, versions, owners>",
              "quote": "<exact sentence copied from the document>"}}],
  "risks": [{{"description": "<security or operational risk the document reveals>", "severity": "high|medium|low",
-            "quote": "<exact sentence copied from the document>"}}]
+            "quote": "<exact sentence copied from the document>"}}],
+ "decisions": [{{"title": "<short name, e.g. 'Money in minor units'>", "kind": "decision|policy|constraint",
+                "status": "accepted|proposed|superseded|rejected|unknown",
+                "rule": "<the normative statement engineers must follow, e.g. 'amounts are integer minor units'>",
+                "applies_to": ["<component id>"], "supersedes": "<title of the decision it replaces, or null>",
+                "quote": "<exact sentence copied from the document>"}}]
 }}
 Rules: use the given component ids when the text refers to them (match by meaning, not only by name);
 otherwise use a short lowercase name. Quotes MUST be copied verbatim. Prefer few precise items over
-many vague ones. Claims must be checkable against code (endpoints, fields, units, ports, owners, flows)."""
+many vague ones. Claims must be checkable against code (endpoints, fields, units, ports, owners, flows).
+decisions = architecture decisions (ADRs, agreed meeting outcomes), policies (rules that must always hold,
+e.g. "never write another service's database") and constraints (limits, e.g. "max 64 kB request body").
+Only report a decision as accepted if the document says it was decided/approved."""
+
+DECISION_KINDS = {"decision", "policy", "constraint"}
+DECISION_STATUS = {"accepted", "proposed", "superseded", "rejected", "unknown"}
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:60] or "untitled"
 
 
 def _extract_one(src, catalog: str):
@@ -132,14 +147,17 @@ def extract_prose(ctx, catalog: str, workers: int, docs) -> tuple[list[str], lis
                     err = f"unusable model output: {e}"
             failed.append(src.path)
             print(f"  ! {src.path}: {err[:120]}")
-    print(f"  prose: {len(docs)} docs, {kept} items kept, {dropped} dropped (quote not found), {len(failed)} failed")
+    n_dec = st.db.execute("SELECT COUNT(*) FROM component WHERE kind IN ('decision','policy','constraint')").fetchone()[0]
+    print(f"  prose: {len(docs)} docs, {kept} items kept ({n_dec} decisions/policies in the graph), "
+          f"{dropped} dropped (quote not found), {len(failed)} failed")
     return ok, failed
 
 
 def _store_prose(ctx, src, out, model) -> tuple[int, int]:
     st = ctx.store
     kept = dropped = 0
-    status = out.get("doc_status") or "unknown"
+    status = out.get("doc_status")
+    status = status if status in {"current", "historical", "proposal", "superseded"} else "unknown"
     date = out.get("effective_date") or src.doc_date
     kind = src.kind
     dtype = out.get("doc_type")
@@ -178,6 +196,29 @@ def _store_prose(ctx, src, out, model) -> tuple[int, int]:
         sev = r.get("severity") if r.get("severity") in {"high", "medium", "low"} else "medium"
         st.risk("doc-reported-risk", sev, src.path, r.get("description", "")[:300],
                 "Check whether the code still has this problem before generating similar code.", 0.6, ev)
+        kept += 1
+    for d in out.get("decisions") or []:
+        ln = locate_quote(src, d.get("quote", ""))
+        if not ln or not d.get("title") or not d.get("rule"):
+            dropped += 1
+            continue
+        dkind = d.get("kind") if d.get("kind") in DECISION_KINDS else "decision"
+        dstatus = d.get("status") if d.get("status") in DECISION_STATUS else "unknown"
+        if status in {"historical", "superseded"} and dstatus == "accepted":
+            dstatus = "superseded"  # an accepted decision inside a superseded document is no longer in force
+        did = f"{dkind}:{_slug(d['title'])}"
+        # the first document that states a decision declares it; later ones only reference it
+        if did in st._known:
+            st.keep(did)
+        else:
+            st.component(did, dkind, str(d["title"])[:200], src.path, status=dstatus, rule=str(d["rule"])[:400],
+                         date=date, supersedes=(str(d["supersedes"])[:200] if d.get("supersedes") else None))
+        ev = st.evidence(src.path, ln, d["quote"], model)
+        # provenance as a relation (evidence ids are owned by this document's unit)
+        st.relation(did, "STATED_IN", f"source:{src.path}", "declared", 0.65, ev, decision_status=dstatus)
+        rel_st = "declared" if dstatus in {"accepted", "proposed", "unknown"} else "outdated"
+        for target in d.get("applies_to") or []:
+            st.relation(did, "GOVERNS", _component(ctx, target), rel_st, 0.65, ev, decision_status=dstatus, kind=dkind)
         kept += 1
     return kept, dropped
 
@@ -308,6 +349,7 @@ Candidates can be gaps (missing owner, missing config, missing docs): confirm a 
 evidence shows the thing is absent where it should be; that is not a code-vs-doc disagreement.
 Rules: only cite ids you were given. A claim that matches the code is NOT a contradiction.
 Two documents disagreeing is a contradiction even if the code is silent; say which is newer.
+Code that breaks an ACCEPTED decision or policy is a conflict; a proposed one is only intent.
 Do not invent connections: the same API name in two unrelated projects is not a relationship
 unless the evidence says so. Return empty lists if nothing is wrong."""
 
@@ -316,7 +358,8 @@ def verify(ctx, workers: int) -> int:
     """Review candidates per component; returns the number of failed jobs. Writes go to the active unit."""
     st, db = ctx.store, ctx.store.db
     comps = [r[0] for r in db.execute(
-        "SELECT DISTINCT component FROM claim WHERE component LIKE 'comp:%' OR component LIKE 'table:%'")]
+        "SELECT DISTINCT component FROM claim WHERE component LIKE 'comp:%' OR component LIKE 'table:%' "
+        "UNION SELECT DISTINCT dst FROM relation WHERE type = 'GOVERNS' AND dst LIKE 'comp:%'")]
     jobs = []
     for cid in comps:
         short = cid.split(":", 1)[1]
@@ -331,7 +374,11 @@ def verify(ctx, workers: int) -> int:
             "JOIN evidence e ON e.id = c.evidence_id WHERE c.component = ? ORDER BY c.id LIMIT 60", (cid,)).fetchall()
         cands = db.execute("SELECT id, description, evidence_ids FROM conflict WHERE subject LIKE ? "
                            "AND verdict IS NULL ORDER BY id", (f"%{short}%",)).fetchall()
-        if not claims and not cands:
+        governing = db.execute(
+            "SELECT c.kind, c.name, c.path, c.props, r.evidence_id, e.quote FROM relation r "
+            "JOIN component c ON c.id = r.src JOIN evidence e ON e.id = r.evidence_id "
+            "WHERE r.dst = ? AND r.type = 'GOVERNS' ORDER BY r.id LIMIT 20", (cid,)).fetchall()
+        if not claims and not cands and not governing:
             continue
         lines = [f"COMPONENT {cid}", "OBSERVED:"]
         ids = set()
@@ -344,6 +391,13 @@ def verify(ctx, workers: int) -> int:
         for text, path, date, status, ev, quote in claims:
             ids.add(ev)
             lines.append(f"  E{ev} [{path}, {date or 'undated'}, {status}] {text} | \"{quote[:160]}\"")
+        if governing:
+            lines.append("DECISIONS / POLICIES governing it (check whether the code follows them):")
+            for kind, name, path, props, ev, quote in governing:
+                ids.add(ev)
+                p = json.loads(props or "{}")
+                lines.append(f"  E{ev} [{kind}, {p.get('status')}, {path}, {p.get('date') or 'undated'}] {name}: "
+                             f"{p.get('rule')} | \"{quote[:140]}\"")
         lines.append("CANDIDATES:")
         cand_ids = set()
         for cid_, desc, evs in cands:

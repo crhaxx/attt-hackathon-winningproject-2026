@@ -9,6 +9,7 @@ Every answer line is: claim  [confidence]  <- source:line "quote"
     python3 query.py risks [path-or-component] # security concerns + guidance
     python3 query.py search "minor units"      # full-text over all sources
     python3 query.py changes [run-id]          # new / resolved findings since the previous ingest
+    python3 query.py decisions [component]     # ADRs, policies, constraints and whether they are in force
     python3 ask.py "free-form question"         # LLM agent over these tools (OpenRouter)
 """
 from __future__ import annotations
@@ -17,6 +18,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -53,37 +55,63 @@ def cite(db, ev_id: int) -> str:
     return f'{loc}  "{e["quote"][:90]}"'
 
 
-def impact(db, name: str):
+def impact(db, name: str, limit: int = 6):
+    """Summary first (owner, data, dependents), then the top decisions, conflicts and risks.
+    Sections are capped at `limit` items, so the most important facts survive output limits."""
     root = resolve(db, name)
-    print(f"Changing {root} can affect:\n")
-    seen, frontier, depth = {root}, [root], 0
+    short = root.split(":", 1)[-1]
+    owners = db.execute("SELECT DISTINCT dst FROM relation WHERE src = ? AND type = 'OWNED_BY'", (root,)).fetchall()
+    tables = db.execute("SELECT dst FROM relation WHERE src = ? AND type = 'HAS_TABLE'", (root,)).fetchall()
+    print(f"Changing {root}")
+    print("  Owner:", ", ".join(o["dst"] for o in owners) or "NONE (gap)")
+    if tables:
+        print("  Owns data:", ", ".join(t["dst"] for t in tables))
+
+    # dependents, hop by hop
+    seen, frontier, depth, layers = {root}, [root], 0, []
     marks = ",".join("?" * len(DEPENDENCY_EDGES))
     while frontier:
         depth += 1
-        nxt = []
+        nxt, layer = [], []
         for node in frontier:
-            for r in db.execute(
+            rows = db.execute(
                 f"SELECT * FROM relation WHERE dst = ? AND type IN ({marks}) AND status != 'outdated' "
-                "ORDER BY confidence DESC", (node, *DEPENDENCY_EDGES)):
-                extra = json.loads(r["props"] or "{}")
-                via = f" {extra.get('method', '')} {extra.get('path', '')}".rstrip() if "path" in extra else ""
-                hop = "directly" if depth == 1 else f"transitively (hop {depth}, via {node})"
-                print(f"  {r['src']:<28} {r['type']}{via} {hop}  [{r['confidence']}]\n      <- {cite(db, r['evidence_id'])}")
-                if r["src"] not in seen:
-                    seen.add(r["src"])
-                    nxt.append(r["src"])
+                "ORDER BY confidence DESC", (node, *DEPENDENCY_EDGES)).fetchall()
+            by_src: dict[str, list] = {}
+            for r in rows:
+                by_src.setdefault(r["src"], []).append(r)
+            for src, rels in by_src.items():
+                if src in seen:
+                    continue
+                seen.add(src)
+                nxt.append(src)
+                layer.append((src, node, rels))
+        if layer:
+            layers.append(layer)
         frontier = nxt
-    tables = db.execute("SELECT dst FROM relation WHERE src = ? AND type = 'HAS_TABLE'", (root,)).fetchall()
-    if tables:
-        print("\n  Owns data:", ", ".join(t["dst"] for t in tables))
-    owners = db.execute("SELECT DISTINCT dst FROM relation WHERE src = ? AND type = 'OWNED_BY'", (root,)).fetchall()
-    print("  Owner:", ", ".join(o["dst"] for o in owners) or "NONE (gap)")
-    docs = db.execute("SELECT r.dst, r.props FROM relation r WHERE src = ? AND type = 'MENTIONED_IN'", (root,)).fetchall()
+    direct = [s for s, _, _ in layers[0]] if layers else []
+    indirect = [s for layer in layers[1:] for s, _, _ in layer]
+    print(f"  Affected: {len(direct)} direct dependents, {len(indirect)} transitive")
+
+    if layers:
+        print("\n  Direct dependents (one line each; use component(<name>) for every piece of evidence):")
+        for src, _, rels in layers[0]:
+            types = sorted({r["type"] for r in rels})
+            paths = sorted({json.loads(r["props"] or "{}").get("path") for r in rels} - {None})
+            via = f" via {', '.join(paths[:3])}" + (" ..." if len(paths) > 3 else "") if paths else ""
+            print(f"  {src:<26} {'+'.join(types)}{via}  [{max(r['confidence'] for r in rels)}]")
+            print(f"      <- {cite(db, rels[0]['evidence_id'])}")
+        for i, layer in enumerate(layers[1:], 2):
+            print(f"  Hop {i}: " + ", ".join(f"{s} (via {n})" for s, n, _ in layer))
+
+    if db.execute("SELECT 1 FROM relation WHERE dst = ? AND type = 'GOVERNS' LIMIT 1", (root,)).fetchone():
+        decisions(db, root, header="\n  Decisions & policies that govern it:", limit=limit)
+    conflicts(db, short, header="\n  Known conflicts touching it:", limit=limit)
+    risks(db, short, header="\n  Security concerns to not repeat:", limit=limit)
+    docs = db.execute("SELECT DISTINCT dst FROM relation WHERE src = ? AND type = 'MENTIONED_IN'", (root,)).fetchall()
     if docs:
-        print(f"  Docs to update ({len(docs)}):", ", ".join(d["dst"].removeprefix("source:") for d in docs))
-    short = root.split(":", 1)[-1]
-    conflicts(db, short, header="\n  Known conflicts touching it:")
-    risks(db, short, header="\n  Security concerns to not repeat:")
+        names = [d["dst"].removeprefix("source:") for d in docs]
+        print(f"\n  Docs that mention it ({len(names)}): " + ", ".join(names[:12]) + (" ..." if len(names) > 12 else ""))
 
 
 def component(db, name: str):
@@ -100,7 +128,12 @@ def component(db, name: str):
                 print(f"  {arrow}  ({r['status']}) [{r['confidence']}]\n      <- {cite(db, r['evidence_id'])}")
 
 
-def conflicts(db, topic: str | None = None, header: str | None = None):
+def _more(total: int, shown: int, hint: str):
+    if total > shown:
+        print(f"  ... {total - shown} more - {hint}")
+
+
+def conflicts(db, topic: str | None = None, header: str | None = None, limit: int | None = None):
     q = "SELECT * FROM conflict WHERE IFNULL(verdict, '') != 'rejected'"
     args = ()
     if topic:
@@ -109,6 +142,7 @@ def conflicts(db, topic: str | None = None, header: str | None = None):
     rows = db.execute(q + " ORDER BY confidence DESC", args).fetchall()
     if header and rows:
         print(header)
+    total, rows = len(rows), rows[:limit] if limit else rows
     for c in rows:
         tag = f" {c['verdict']}" if c["verdict"] else ""
         print(f"  [{c['kind'].upper()} {c['confidence']}{tag}] {c['description']}")
@@ -116,11 +150,12 @@ def conflicts(db, topic: str | None = None, header: str | None = None):
             print(f"      verifier: {c['rationale']}")
         for ev in json.loads(c["evidence_ids"]):
             print(f"      <- {cite(db, ev)}")
+    _more(total, len(rows), f"call conflicts('{topic or ''}') for all")
     if not rows and not header:
         print("no conflicts found")
 
 
-def risks(db, target: str | None = None, header: str | None = None):
+def risks(db, target: str | None = None, header: str | None = None, limit: int | None = None):
     q = "SELECT * FROM risk WHERE rule != 'agent-instructions-in-corpus'"
     args = ()
     if target:
@@ -130,9 +165,11 @@ def risks(db, target: str | None = None, header: str | None = None):
                       args).fetchall()
     if header and rows:
         print(header)
+    total, rows = len(rows), rows[:limit] if limit else rows
     for r in rows:
         print(f"  [{r['severity'].upper()} {r['confidence']:.2f}] {r['rule']}: {r['description']}\n"
               f"      do instead: {r['guidance']}\n      <- {cite(db, r['evidence_id'])}")
+    _more(total, len(rows), f"call risks('{target or ''}') for all")
     if not target:
         n = db.execute("SELECT COUNT(*) FROM risk WHERE rule = 'agent-instructions-in-corpus'").fetchone()[0]
         if n:
@@ -151,6 +188,55 @@ def search(db, text: str):
         print(f"  {r['path']} ({r['kind']})\n      {' '.join(r['s'].split())}")
 
 
+def decisions(db, target: str | None = None, header: str | None = None, limit: int | None = None):
+    """Architecture decisions, policies and constraints, optionally for one component or matching a word."""
+    q = ("SELECT DISTINCT c.* FROM component c LEFT JOIN relation r ON r.src = c.id AND r.type = 'GOVERNS' "
+         "WHERE c.kind IN ('decision', 'policy', 'constraint')")
+    args: tuple = ()
+    if target:
+        cid = None
+        try:
+            cid = resolve(db, target)
+        except SystemExit:
+            pass
+        if cid and cid.startswith("comp:"):
+            q += " AND r.dst = ?"
+            args = (cid,)
+        else:
+            q += " AND (c.name LIKE ? OR c.props LIKE ? OR c.path LIKE ?)"
+            args = (f"%{target}%",) * 3
+    rows = db.execute(q + " ORDER BY c.kind, c.name", args).fetchall()
+    if header and rows:
+        print(header)
+    order = {"accepted": 0, "unknown": 1, "proposed": 2, "superseded": 3, "rejected": 4}
+    rows = sorted(rows, key=lambda c: order.get(json.loads(c["props"] or "{}").get("status"), 9))
+    total, rows = len(rows), rows[:limit] if limit else rows
+    for c in rows:
+        p = json.loads(c["props"] or "{}")
+        applies = [r[0] for r in db.execute("SELECT DISTINCT dst FROM relation WHERE src = ? AND type = 'GOVERNS'",
+                                            (c["id"],))]
+        sup = []
+        if p.get("supersedes"):  # resolved by title at query time (decisions live in different documents)
+            slug = re.sub(r"[^a-z0-9]+", "-", p["supersedes"].lower()).strip("-")[:60]
+            sup = [r[0] for r in db.execute(
+                "SELECT id FROM component WHERE kind IN ('decision','policy','constraint') AND id LIKE ? AND id != ?",
+                (f"%:{slug}", c["id"]))] or [f"'{p['supersedes']}' (not found)"]
+        note = " - IN FORCE" if p.get("status") == "accepted" else " - intent only, not approved" \
+            if p.get("status") == "proposed" else " - NO LONGER IN FORCE" if p.get("status") in {"superseded", "rejected"} else ""
+        print(f"  [{c['kind'].upper()} {p.get('status', '?')}{note}] {c['name']}: {p.get('rule')}")
+        if applies:
+            print(f"      applies to: {', '.join(applies[:6])}")
+        if sup:
+            print(f"      supersedes: {', '.join(sup)}")
+        stated = db.execute("SELECT evidence_id FROM relation WHERE src = ? AND type IN ('STATED_IN', 'GOVERNS') "
+                            "ORDER BY type = 'GOVERNS', id LIMIT 1", (c["id"],)).fetchone()
+        if stated:
+            print(f"      <- {cite(db, stated[0])}")
+    _more(total, len(rows), f"call decisions('{target or ''}') for all")
+    if not rows and not header:
+        print("no decisions or policies found")
+
+
 def changes(db, run: str | None = None):
     """What appeared / disappeared in a run compared with its baseline (default: latest run)."""
     runs = db.execute("SELECT * FROM run ORDER BY id").fetchall()
@@ -166,6 +252,7 @@ def changes(db, run: str | None = None):
     rows = db.execute("SELECT * FROM change WHERE run_id = ? ORDER BY change, item", (target,)).fetchall()
     print(f"\nchanges in run #{target}:" if rows else f"\nno changes recorded for run #{target}")
     latest = target == runs[-1]["id"]
+    total, rows = len(rows), rows[:30]
     for c in rows:
         sign = "+" if c["change"] == "new" else "-"
         print(f"  {sign} {c['change'].upper()} {c['item']}: {c['summary']}")
@@ -173,8 +260,9 @@ def changes(db, run: str | None = None):
             table = "conflict" if c["item"] == "conflict" else "risk"
             row = db.execute(f"SELECT * FROM {table} WHERE id = ?", (c["ref_id"],)).fetchone()
             evs = json.loads(row["evidence_ids"]) if table == "conflict" else [row["evidence_id"]]
-            for ev in evs[:3]:
+            for ev in evs[:2]:
                 print(f"      <- {cite(db, ev)}")
+    _more(total, len(rows), "query the change table with sql for the rest")
 
 
 def run_tool(db, ro, name: str, args: dict) -> str:
@@ -192,6 +280,8 @@ def run_tool(db, ro, name: str, args: dict) -> str:
                 risks(db, args.get("target") or None)
             elif name == "changes":
                 changes(db, args.get("run") or None)
+            elif name == "decisions":
+                decisions(db, args.get("target") or None)
             elif name == "read_source":
                 row = db.execute("SELECT text FROM source WHERE path = ?", (args["path"],)).fetchone()
                 if not row or row[0] is None:
@@ -219,7 +309,8 @@ def run_tool(db, ro, name: str, args: dict) -> str:
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in {"impact", "component", "conflicts", "risks", "search", "changes"}:
+    if len(sys.argv) < 2 or sys.argv[1] not in {"impact", "component", "conflicts", "risks", "search", "changes",
+                                                 "decisions"}:
         sys.exit(__doc__)
     cmd, arg = sys.argv[1], " ".join(sys.argv[2:]) or None
     if cmd in {"impact", "component", "search"} and not arg:

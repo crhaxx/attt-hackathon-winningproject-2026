@@ -143,6 +143,9 @@ A *prose file* is written in human language rather than code: wiki pages, ADRs, 
 notes, incidents, issues, release notes, READMEs. Each one is read in parallel. Given the
 list of known components, the model returns JSON with:
 - the document's type (wiki, ADR, incident, …), decided from the content and not the folder
+- **decisions, policies and constraints**, each with a status (accepted / proposed /
+  superseded / rejected), the rule text, and `GOVERNS` links to the components they apply to
+  (see [ONTOLOGY.md](ONTOLOGY.md))
 - the document's status: current, historical, proposal or superseded
 - facts about relationships between components
 - concrete claims, e.g. "orders expose `total` in dollars"
@@ -325,7 +328,14 @@ python3 query.py changes                 # new / resolved since the previous ing
 Fast, free and deterministic. A safe fallback for demos. Set `CONTEXT_DB=<file>` to query
 another database (this also works for `ask.py`).
 
-### `ask.py`: questions in plain language
+### `mcp/server.py`: the interface for IDE agents
+An MCP server (stdio, or HTTP with `--http`) that exposes the `query.py` functions as tools:
+`status`, `impact`, `component`, `conflicts`, `risks`, `decisions`, `changes`, `search`,
+`read_source` and `sql`. This is how Cursor / Claude Code use the Context Service. It is
+read-only, opens `context.db` per call, and caps outputs for the agent's context window.
+Configured in `.cursor/mcp.json` and `.mcp.json`.
+
+### `ask.py`: CLI fallback (questions in plain language)
 ```sh
 python3 ask.py "If I change how order-service stores money, what breaks and which docs are wrong?"
 python3 ask.py --show-tools "Where is the auth model weak?"

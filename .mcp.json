@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "context-service": {
+      "command": "python3",
+      "args": ["mcp/server.py"]
+    }
+  }
+}

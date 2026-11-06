@@ -45,6 +45,8 @@ TOOLS = [
     ("risks", "Security risks, optionally filtered by component or path.", {"target": "string"}),
     ("changes", "Run history and the findings that are new or resolved since the previous ingest "
                 "(optionally for a given run id).", {"run": "string"}),
+    ("decisions", "Architecture decisions, policies and constraints and whether they are in force, "
+                  "optionally for a component or matching a word.", {"target": "string"}),
     ("read_source", "Read lines of a repository file.", {"path": "string", "start": "integer", "end": "integer"}),
     ("sql", "Read-only SQL over context.db. Tables: source(path,kind,archived,doc_date,git_date,doc_status,"
             "summary,text,blob), component(id,kind,name,path,props), relation(src,type,dst,status,confidence,"
