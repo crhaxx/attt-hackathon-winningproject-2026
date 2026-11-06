@@ -45,11 +45,13 @@ class LLMError(RuntimeError):
 
 
 def chat(messages: list[dict], model: str, *, tools: list | None = None, json_mode: bool = False,
-         max_tokens: int = 4000, cache: bool = True) -> dict:
+         max_tokens: int = 4000, cache: bool = True, tool_choice: str | None = None) -> dict:
     """Returns the assistant message dict. Identical requests are served from cache."""
     body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0}
     if tools:
         body["tools"] = tools
+    if tool_choice:
+        body["tool_choice"] = tool_choice
     if json_mode:
         body["response_format"] = {"type": "json_object"}
     raw = json.dumps(body, sort_keys=True)

@@ -72,6 +72,14 @@ def check_citations(db, answer: str) -> list[str]:
     return bad
 
 
+def finish(db, msg: dict) -> str:
+    answer = msg.get("content") or ""
+    bad = check_citations(db, answer)
+    if bad:
+        answer += "\n\n> ⚠ unverified citations (not in the repository): " + ", ".join(bad)
+    return answer
+
+
 def ask(question: str, show_tools: bool = False, max_steps: int = 10) -> str:
     db = query.connect()
     ro = sqlite3.connect(f"file:{query.DB}?mode=ro", uri=True)
@@ -80,11 +88,7 @@ def ask(question: str, show_tools: bool = False, max_steps: int = 10) -> str:
         msg = llm.chat(messages, llm.REASON_MODEL, tools=tool_specs(), max_tokens=4000, cache=False)
         calls = msg.get("tool_calls") or []
         if not calls:
-            answer = msg.get("content") or ""
-            bad = check_citations(db, answer)
-            if bad:
-                answer += "\n\n> ⚠ unverified citations (not in the repository): " + ", ".join(bad)
-            return answer
+            return finish(db, msg)
         messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
         for c in calls:
             fn = c["function"]["name"]
@@ -95,7 +99,13 @@ def ask(question: str, show_tools: bool = False, max_steps: int = 10) -> str:
             if show_tools:
                 print(f"  → {fn}({json.dumps(args)})", file=sys.stderr)
             messages.append({"role": "tool", "tool_call_id": c["id"], "content": query.run_tool(db, ro, fn, args)})
-    return "Stopped: too many tool steps without a final answer."
+    # out of tool steps: answer from what has been gathered instead of giving up
+    if show_tools:
+        print("  → (tool budget used up, asking for the final answer)", file=sys.stderr)
+    messages.append({"role": "user", "content": "Stop using tools now. Write the final answer from the tool "
+                     "results above, in the required format. Say which parts you could not check."})
+    msg = llm.chat(messages, llm.REASON_MODEL, tools=tool_specs(), tool_choice="none", max_tokens=6000, cache=False)
+    return finish(db, msg)
 
 
 def main():
