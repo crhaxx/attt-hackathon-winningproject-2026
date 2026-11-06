@@ -32,8 +32,8 @@ def _load_env():
 
 
 _load_env()
-EXTRACT_MODEL = os.environ.get("EXTRACT_MODEL", "anthropic/claude-haiku-5.5")
-REASON_MODEL = os.environ.get("REASON_MODEL", "anthropic/claude-sonnet-5.5")
+EXTRACT_MODEL = os.environ.get("EXTRACT_MODEL", "deepseek/deepseek-v4.1-flash")
+REASON_MODEL = os.environ.get("REASON_MODEL", "deepseek/deepseek-v4.1-flash")
 
 
 def available() -> bool:
