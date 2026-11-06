@@ -127,9 +127,21 @@ Now the robot lays all the facts side by side and looks for things that don't ad
 - a wiki page describes a database column that was removed long ago
 - a program depends on another one, but the start-up settings don't say so
 - a program has **no responsible team**, so nobody would get the call when it breaks
+- **a shared building block's "shop window" is wrong.** A package advertises parts that nobody
+  uses, or points to files that don't exist
+- **the shared settings templates have drifted.** A template nobody uses, a settings file that
+  points to a missing file, or a project that ignores the shared template everyone else follows
+- **one project checks its work with a different tool than the others.** Its "check for mistakes
+  before shipping" step calls another program, so its checks don't match the rest
 
-<sub>⚙️ `check_endpoints`, `check_deploy_vs_code`, `check_schema_drift` and `check_ownership` write
-`conflict` rows (kind conflict / gap / stale). Each one points to all of its evidence.</sub>
+<sub>⚙️ `check_endpoints`, `check_deploy_vs_code`, `check_schema_drift`, `check_ownership` and
+`check_package_surface` write `conflict` rows (kind conflict / gap / stale). Each one points to all of its
+evidence. The package-surface checks: `unused-package-export` (a `package.json` `exports` entry that no file
+imports, or that points to a missing file); `tsconfig-missing-file` (a tsconfig `extends`/`references` target
+that isn't in the repo); `unused-tsconfig-preset` (a shared TypeScript preset nothing extends);
+`tsconfig-ignores-shared` / `tsconfig-not-shared` (a project inlining its own compiler options instead of
+extending the shared config); `typecheck-entrypoint` (a `check-types`/`typecheck` script that calls a
+different compiler than the other projects).</sub>
 
 ### Step 6: The security inspector
 
