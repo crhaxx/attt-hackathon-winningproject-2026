@@ -1,4 +1,4 @@
-"""Context Service - stage 2: LLM enrichment via OpenRouter.
+"""Read-Only - stage 2: LLM enrichment via OpenRouter.
 
 Runs after the deterministic stage (ingest.py) on the same in-memory context:
 
@@ -525,7 +525,7 @@ def check_diagrams(ctx):
 
 # --------------------------------------------------------------------------- C. verification
 
-VERIFY_SYSTEM = f"""You are the verification step of an engineering Context Service.
+VERIFY_SYSTEM = f"""You are the verification step of Read-Only, an engineering context service.
 You get, for ONE component: OBSERVED facts (from code/config - ground truth for current behaviour),
 DOCUMENTED claims (from docs, with dates and document status), and CANDIDATE conflicts found by rules.
 Evidence is referenced by ids like E12; candidate conflicts by ids like C3.

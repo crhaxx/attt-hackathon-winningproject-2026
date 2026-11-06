@@ -1,6 +1,6 @@
 # Ontology
 
-The Context Service stores engineering knowledge as a **typed, evidence-backed graph** in one
+Read-Only stores engineering knowledge as a **typed, evidence-backed graph** in one
 SQLite file (`context.db`). This document is the predefined ontology the pipeline classifies,
 maps and validates against. Every entity and relation type listed here is the closed set the
 code accepts. An AI output with any other type is dropped.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Context Service - ingest pipeline (incremental, Git-driven).
+"""Read-Only - ingest pipeline (incremental, Git-driven).
 
 Turns any engineering repository into one SQLite knowledge base (context.db) and keeps it
 up to date commit by commit. Nothing here depends on a particular repository's folder names
@@ -306,7 +306,7 @@ def schema_state(db: sqlite3.Connection) -> str:
         return "empty"
     if version == 0 and {"source", "component", "relation", "evidence"} <= tables:
         return "legacy"
-    raise IngestError("database is not a Context Service database (unknown tables); use another --db")
+    raise IngestError("database is not a Read-Only database (unknown tables); use another --db")
 
 
 def create_schema(db: sqlite3.Connection):

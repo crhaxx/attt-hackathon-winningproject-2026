@@ -1,4 +1,4 @@
-# Context Service: how the workflow works
+# Read-Only: how the workflow works
 
 One command, `python3 ingest.py`, turns the engineering repository
 [arkik7/att-hackathon-task](https://github.com/arkik7/att-hackathon-task) into one SQLite
@@ -366,7 +366,7 @@ An MCP server (stdio, or HTTP with `--http`) that exposes the `query.py` functio
 call, a component's relationships (implemented apart from documented and outdated), governing decisions,
 document claims with their perspective, linked findings with the basis of each link, recorded gaps, the
 snapshot/stage state and the cited source passages. It fits a size budget by dropping passages first, then
-shortening lists, and reports what it left out (JSON stays valid). `focus` only reorders; it never hides. This is how Cursor / Claude Code use the Context Service. It is
+shortening lists, and reports what it left out (JSON stays valid). `focus` only reorders; it never hides. This is how Cursor / Claude Code use Read-Only. It is
 read-only, opens `context.db` per call, and caps outputs for the agent's context window.
 Configured in `.cursor/mcp.json` and `.mcp.json`.
 

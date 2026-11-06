@@ -1,4 +1,4 @@
-# How the Context Service works: explained for everyone
+# How Read-Only works: explained for everyone
 
 This page explains the whole system without assuming you can code. Each part has a plain
 explanation first. The small grey text under it is for technical readers and says what
@@ -264,7 +264,7 @@ window. `ask.py` is a command-line fallback agent with the same tools.</sub>
 6. An AI assistant asked to "show the order total" now gets: *"Use `total_minor` (cents). Don't
    trust `wiki/orders-client.md`, it's out of date"*, with the receipts attached.
 
-Without the Context Service, an assistant that trusted the wiki could have used a field that no
+Without Read-Only, an assistant that trusted the wiki could have used a field that no
 longer exists, or shown $2500.00 instead of $25.00.
 
 <sub>⚙️ Evidence: `wiki/orders-client.md:5`, `apps/order-service/migrations/002-minor-units.sql:3`

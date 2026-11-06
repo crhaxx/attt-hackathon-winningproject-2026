@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "context-service": {
+    "read-only": {
       "command": "python3",
       "args": ["mcp/server.py"]
     }

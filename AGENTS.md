@@ -8,7 +8,7 @@ V dokumentu je brief AT&T Hackathon (Efficient AI Context Service for Enterprise
 
 ## Co z dokumentu plyne
 
-- Stavíme automatizovaný Context Service. Pipeline sama načte zdroje, roztřídí je, uloží fakta a najde rozpory. Znalosti se nevypisují ručně.
+- Stavíme Read-Only, automatizovaný context service. Pipeline sama načte zdroje, roztřídí je, uloží fakta a najde rozpory. Znalosti se nevypisují ručně.
 - Jediný zdroj dat je repozitář [arkik7/att-hackathon-task](https://github.com/arkik7/att-hackathon-task). Jen ho čteme. Nic v něm neupravujeme a nic do něj necommitujeme.
 - Každá odpověď, kterou systém vrátí, má tvrzení, zdroj a míru jistoty. Fakt bez zdroje se do odpovědi nedostane.
 - Systém nespojuje všechno. Stejné API ve dvou projektech ještě není vztah, dokud na to není evidence. Rozlišuje ověřená fakta, předpoklady, zastaralé informace, rozpory, slabou evidenci a bezpečnostní rizika.

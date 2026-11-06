@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Query the Context Service database built by ingest.py.
+"""Query the Read-Only database built by ingest.py.
 
 Every answer line is: claim  [confidence]  <- source:line "quote"
 

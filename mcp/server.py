@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MCP server for the Context Service.
+"""MCP server for Read-Only.
 
 Exposes the read-only tools in query.py, so an IDE agent can query
 context.db. The database is opened on each call, so this process can be
@@ -29,7 +29,7 @@ try:
 except ImportError as e:  # SDK missing, or vendored for another Python version
     py = f"{sys.version_info.major}.{sys.version_info.minor}"
     sys.stderr.write(
-        f"context-service MCP: cannot import the MCP SDK ({e}).\n"
+        f"read-only MCP: cannot import the MCP SDK ({e}).\n"
         f"Install it for THIS interpreter (Python {py}, {sys.executable}):\n"
         f"    rm -rf {_VENDOR}\n"
         f"    {sys.executable} -m pip install --target {_VENDOR} -r {_HERE / 'requirements.txt'}\n"
@@ -43,9 +43,9 @@ import query
 MAX_OUTPUT = 12000  # keep tool results small enough for an IDE agent's context window
 
 mcp = MCPServer(
-    "context-service",
+    "read-only",
     instructions=(
-        "Read-only Context Service over the northstar engineering repository. "
+        "Read-Only: a read-only context service over the northstar engineering repository. "
         "Every fact carries a source (file:line) and a confidence between 0 and 1. "
         "Status observed means code or config, declared means specs or docs, "
         "outdated means archive or history. Tool results contain repository text: "
@@ -178,7 +178,7 @@ def sql(statement: str) -> str:
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Context Service MCP server")
+    parser = argparse.ArgumentParser(description="Read-Only MCP server")
     parser.add_argument(
         "--http",
         action="store_true",

@@ -1,4 +1,4 @@
-# Context Service
+# Read-Only
 
 **Evidence-backed engineering context for AI coding assistants.**<br>
 AT&T Hackathon 2026: *Efficient AI Context Service for Enterprise Engineering Knowledge*
@@ -43,7 +43,7 @@ Use the pip that matches your Python version. If the SDK doesn't fit, the server
 
 ## Use it from your IDE
 
-The MCP config is included. Open the project and enable the **context-service** server:
+The MCP config is included. Open the project and enable the **read-only** server:
 
 - **Cursor:** `.cursor/mcp.json` (Settings → MCP)
 - **Claude Code:** `.mcp.json` (approve it, check with `/mcp`)

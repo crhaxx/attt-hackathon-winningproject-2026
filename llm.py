@@ -83,7 +83,7 @@ def _send(raw: str) -> dict:
     req = urllib.request.Request(API, data=raw.encode(), headers={
         "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
         "Content-Type": "application/json",
-        "X-Title": "attt-context-service",
+        "X-Title": "attt-read-only",
     })
     for attempt in range(4):
         try:
