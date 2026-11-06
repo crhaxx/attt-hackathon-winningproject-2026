@@ -59,6 +59,25 @@ def chat(messages: list[dict], model: str, *, tools: list | None = None, json_mo
         return json.loads(path.read_text())
     if not available():
         raise LLMError("OPENROUTER_API_KEY is not set (env or .env)")
+    msg, finish = _send(raw)
+    if (_empty(msg) or finish == "length") and max_tokens < 32000:
+        # Reasoning models (e.g. DeepSeek) can spend the budget on hidden reasoning and return an
+        # empty or cut-off answer. Retry once with more room and less reasoning.
+        retry = dict(body, max_tokens=min(max_tokens * 4, 32000), reasoning={"effort": "low"})
+        msg, finish = _send(json.dumps(retry, sort_keys=True))
+    if _empty(msg):
+        raise LLMError(f"model returned an empty answer (reasoning used {len(msg.get('reasoning') or '')} chars)")
+    if cache and finish != "length":  # never cache empty/cut-off answers: a rerun would replay the failure
+        CACHE.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(msg))
+    return msg
+
+
+def _empty(msg: dict) -> bool:
+    return not (msg.get("content") or "").strip() and not msg.get("tool_calls")
+
+
+def _send(raw: str) -> dict:
     req = urllib.request.Request(API, data=raw.encode(), headers={
         "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
         "Content-Type": "application/json",
@@ -82,11 +101,8 @@ def chat(messages: list[dict], model: str, *, tools: list | None = None, json_mo
             raise LLMError(f"OpenRouter unreachable: {e}") from None
     if "error" in data:
         raise LLMError(f"OpenRouter error: {data['error']}")
-    msg = data["choices"][0]["message"]
-    if cache:
-        CACHE.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(msg))
-    return msg
+    choice = data["choices"][0]
+    return choice["message"], choice.get("finish_reason") or choice.get("native_finish_reason")
 
 
 def chat_json(system: str, user: str | list, model: str, max_tokens: int = 4000) -> dict:
