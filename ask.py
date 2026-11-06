@@ -45,13 +45,16 @@ TOOLS = [
                "docs to update, conflicts and security risks.", {"name": "string"}),
     ("conflicts", "Conflicts / gaps / stale docs, optionally filtered by a topic word.", {"topic": "string"}),
     ("risks", "Security risks, optionally filtered by component or path.", {"target": "string"}),
+    ("changes", "Run history and the findings that are new or resolved since the previous ingest "
+                "(optionally for a given run id).", {"run": "string"}),
     ("read_source", "Read lines of a repository file.", {"path": "string", "start": "integer", "end": "integer"}),
     ("sql", "Read-only SQL over context.db. Tables: source(path,kind,archived,doc_date,git_date,doc_status,"
             "summary,text), component(id,kind,name,path,props), relation(src,type,dst,status,confidence,"
             "evidence_id,props), evidence(id,path,line,quote,extractor), claim(component,topic,text,path,"
             "doc_date,doc_status,evidence_id), conflict(kind,check_name,subject,description,confidence,"
-            "evidence_ids,verdict,rationale), risk(rule,severity,subject,description,guidance,confidence,"
-            "evidence_id).", {"query": "string"}),
+            "evidence_ids,verdict,rationale,fingerprint), risk(rule,severity,subject,description,guidance,"
+            "confidence,evidence_id,fingerprint), run(id,repo,commit_sha,finished,llm,conflicts,risks,new,resolved,"
+            "baseline_run), change(run_id,item,change,fingerprint,summary,ref_id).", {"query": "string"}),
 ]
 REQUIRED = {"search": ["text"], "component": ["name"], "impact": ["name"], "read_source": ["path"], "sql": ["query"]}
 
@@ -75,6 +78,8 @@ def run_tool(db, ro, name: str, args: dict) -> str:
                 query.conflicts(db, args.get("topic") or None)
             elif name == "risks":
                 query.risks(db, args.get("target") or None)
+            elif name == "changes":
+                query.changes(db, args.get("run") or None)
             elif name == "read_source":
                 row = db.execute("SELECT text FROM source WHERE path = ?", (args["path"],)).fetchone()
                 if not row or row[0] is None:

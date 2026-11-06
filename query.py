@@ -8,18 +8,20 @@ Every answer line is: claim  [confidence]  <- source:line "quote"
     python3 query.py conflicts [topic]         # contradictions, gaps, stale docs
     python3 query.py risks [path-or-component] # security concerns + guidance
     python3 query.py search "minor units"      # full-text over all sources
+    python3 query.py changes [run-id]          # new / resolved findings since the previous ingest
     python3 ask.py "free-form question"         # LLM agent over these tools (OpenRouter)
 """
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
-DB = Path(__file__).resolve().parent / "context.db"
+DB = Path(os.environ.get("CONTEXT_DB") or Path(__file__).resolve().parent / "context.db")
 # edges along which a change propagates from dst back to src
-DEPENDENCY_EDGES = ("DEPENDS_ON", "CALLS", "CONFIGURED_TO_CALL", "COMPOSE_DEPENDS_ON")
+DEPENDENCY_EDGES = ("DEPENDS_ON", "CALLS", "CONFIGURED_TO_CALL", "DEPLOY_DEPENDS_ON")
 
 
 def connect() -> sqlite3.Connection:
@@ -33,7 +35,7 @@ def connect() -> sqlite3.Connection:
 def resolve(db, name: str) -> str:
     row = db.execute(
         "SELECT id FROM component WHERE id = ? OR name = ? OR id LIKE ? "
-        "ORDER BY CASE kind WHEN 'app' THEN 0 WHEN 'package' THEN 1 ELSE 2 END LIMIT 1",
+        "ORDER BY CASE WHEN id LIKE 'comp:%' THEN 0 ELSE 1 END, length(id) LIMIT 1",
         (name, name, f"%:{name}"),
     ).fetchone()
     if not row:
@@ -145,8 +147,34 @@ def search(db, text: str):
         print(f"  {r['path']} ({r['kind']})\n      {' '.join(r['s'].split())}")
 
 
+def changes(db, run: str | None = None):
+    """What appeared / disappeared in a run compared with its baseline (default: latest run)."""
+    runs = db.execute("SELECT * FROM run ORDER BY id").fetchall()
+    if not runs:
+        print("no runs recorded")
+        return
+    print("run history:")
+    for r in runs[-8:]:
+        base = f"vs #{r['baseline_run']}: +{r['new']} new, -{r['resolved']} resolved" if r["baseline_run"] else "baseline"
+        print(f"  #{r['id']}  {r['finished']}  commit {r['commit_sha']}  llm={'on' if r['llm'] else 'off'}  "
+              f"{r['conflicts']} conflicts, {r['risks']} risks  ({base})")
+    target = int(run) if run and run.isdigit() else runs[-1]["id"]
+    rows = db.execute("SELECT * FROM change WHERE run_id = ? ORDER BY change, item", (target,)).fetchall()
+    print(f"\nchanges in run #{target}:" if rows else f"\nno changes recorded for run #{target}")
+    latest = target == runs[-1]["id"]
+    for c in rows:
+        sign = "+" if c["change"] == "new" else "-"
+        print(f"  {sign} {c['change'].upper()} {c['item']}: {c['summary']}")
+        if latest and c["ref_id"]:
+            table = "conflict" if c["item"] == "conflict" else "risk"
+            row = db.execute(f"SELECT * FROM {table} WHERE id = ?", (c["ref_id"],)).fetchone()
+            evs = json.loads(row["evidence_ids"]) if table == "conflict" else [row["evidence_id"]]
+            for ev in evs[:3]:
+                print(f"      <- {cite(db, ev)}")
+
+
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in {"impact", "component", "conflicts", "risks", "search"}:
+    if len(sys.argv) < 2 or sys.argv[1] not in {"impact", "component", "conflicts", "risks", "search", "changes"}:
         sys.exit(__doc__)
     cmd, arg = sys.argv[1], " ".join(sys.argv[2:]) or None
     if cmd in {"impact", "component", "search"} and not arg:

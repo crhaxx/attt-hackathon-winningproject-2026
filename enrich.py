@@ -23,7 +23,9 @@ from concurrent.futures import ThreadPoolExecutor
 import llm
 
 PROSE_KINDS = {"wiki", "doc", "adr", "runbook", "meeting_note", "incident", "issue",
-               "release_note", "api_doc"}
+               "release_note", "api_doc", "design_doc", "readme"}
+DOC_TYPES = ["readme", "wiki", "adr", "design_doc", "meeting_note", "incident", "issue", "release_note",
+             "runbook", "api_doc", "how_to", "other"]
 REL_TYPES = ["DEPENDS_ON", "CALLS", "OWNED_BY", "READS", "WRITES", "PUBLISHES_EVENT",
              "CONSUMES_EVENT", "REPLACES", "DEPRECATES", "MIGRATES_TO", "AFFECTED_BY_INCIDENT",
              "DECIDED_BY", "SHARES_DATA_WITH"]
@@ -56,6 +58,7 @@ EXTRACT_SYSTEM = f"""You extract an engineering knowledge graph from one reposit
 {UNTRUSTED}
 Return ONE JSON object:
 {{
+ "doc_type": "<one of {'|'.join(DOC_TYPES)}>",
  "doc_status": "current|historical|proposal|superseded|unknown",
  "effective_date": "YYYY-MM-DD or null (date the document states for itself)",
  "summary": "one sentence",
@@ -102,6 +105,12 @@ def extract_prose(ctx, catalog: str, workers: int):
                 continue
             status = out.get("doc_status") or "unknown"
             date = out.get("effective_date") or src.doc_date
+            dtype = out.get("doc_type")
+            if src.kind == "doc" and dtype in DOC_TYPES and dtype != "other":
+                src.kind = dtype  # classification by content, not by folder name
+                st.db.execute("UPDATE source SET kind = ? WHERE path = ?", (dtype, src.path))
+                if st.fts:
+                    st.db.execute("UPDATE source_fts SET kind = ? WHERE path = ?", (dtype, src.path))
             st.db.execute("UPDATE source SET doc_status = ?, summary = ?, doc_date = COALESCE(doc_date, ?) "
                           "WHERE path = ?", (status, out.get("summary"), date, src.path))
             rel_status = "outdated" if status in {"historical", "superseded"} or src.archived else "declared"
@@ -144,11 +153,11 @@ def _component(ctx, ref: str | None) -> str:
     ref = (ref or "unknown").strip()
     if ref in ctx.store._components:
         return ref
-    for prefix in ("app:", "package:", "archived-project:"):
-        if prefix + ref in ctx.store._components:
-            return prefix + ref
-    if ref in ctx.pkg_to_component:
-        return ctx.pkg_to_component[ref]
+    if "comp:" + ref.lower() in ctx.store._components:
+        return "comp:" + ref.lower()
+    hit = ctx.resolve(ref)
+    if hit:
+        return hit
     slug = re.sub(r"[^a-z0-9.-]+", "-", ref.lower()).strip("-")[:60] or "unknown"
     return ctx.store.component(f"concept:{slug}", "concept", ref)
 
@@ -180,7 +189,7 @@ def read_diagrams(ctx, repo, catalog: str, workers: int):
 
     observed = {(r[0], r[1]) for r in st.db.execute(
         "SELECT src, dst FROM relation WHERE status='observed' AND type IN "
-        "('CALLS','CONFIGURED_TO_CALL','COMPOSE_DEPENDS_ON','DEPENDS_ON')")}
+        "('CALLS','CONFIGURED_TO_CALL','DEPLOY_DEPENDS_ON','DEPENDS_ON')")}
     model = f"llm:{llm.REASON_MODEL}"
     with ThreadPoolExecutor(workers) as pool:
         for src, out, err in pool.map(one, diagrams):
@@ -201,7 +210,7 @@ def read_diagrams(ctx, repo, catalog: str, workers: int):
                 a_id, b_id = _component(ctx, a or e.get("from")), _component(ctx, b or e.get("to"))
                 st.relation(a_id, "DIAGRAM_EDGE", b_id, "declared", 0.6, ev, label=e.get("label"))
                 drawn.add((a_id, b_id))
-                if (out.get("diagram_type") == "architecture" and a_id.startswith("app:") and b_id.startswith("app:")
+                if (out.get("diagram_type") == "architecture" and a_id.startswith("comp:") and b_id.startswith("comp:")
                         and (a_id, b_id) not in observed and (b_id, a_id) not in observed):
                     st.conflict("conflict", "diagram-edge-not-in-code", f"{a_id} -> {b_id}",
                                 f"{src.path} ({out.get('date_or_version') or src.doc_date or 'undated'}) draws "
@@ -209,7 +218,7 @@ def read_diagrams(ctx, repo, catalog: str, workers: int):
                                 0.6, [ev])
             if out.get("diagram_type") == "architecture":
                 for a_id, b_id in sorted(observed):
-                    if a_id.startswith("app:") and b_id.startswith("app:") and (a_id, b_id) not in drawn \
+                    if a_id.startswith("comp:") and b_id.startswith("comp:") and (a_id, b_id) not in drawn \
                             and (b_id, a_id) not in drawn and a_id in shown and b_id in shown:
                         ev = st.evidence(src.path, None, f"diagram has no edge {a_id} -> {b_id}", model)
                         st.conflict("gap", "code-call-missing-from-diagram", f"{a_id} -> {b_id}",
@@ -241,8 +250,7 @@ unless the evidence says so. Return empty lists if nothing is wrong."""
 def verify(ctx, workers: int):
     st, db = ctx.store, ctx.store.db
     comps = [r[0] for r in db.execute(
-        "SELECT DISTINCT component FROM claim WHERE component LIKE 'app:%' OR component LIKE 'package:%' "
-        "OR component LIKE 'archived-project:%' OR component LIKE 'table:%'")]
+        "SELECT DISTINCT component FROM claim WHERE component LIKE 'comp:%' OR component LIKE 'table:%'")]
     jobs = []
     for cid in comps:
         short = cid.split(":", 1)[1]
@@ -319,19 +327,132 @@ def verify(ctx, workers: int):
           f"{new} new contradictions")
 
 
+# --------------------------------------------------------------------------- 0. code (any language)
+
+CODE_SYSTEM = f"""You read ONE source file of a software system and report its integration surface.
+{UNTRUSTED}
+Return ONE JSON object:
+{{"routes": [{{"method": "GET|POST|PUT|PATCH|DELETE|*", "path": "/v1/things/{{id}}", "quote": "<exact line>"}}],
+  "calls": [{{"target": "<how the code names the other service: env var name, URL, host or client name>",
+             "method": "GET|POST|...|*", "path": "/path/{{param}} or null", "quote": "<exact line>"}}],
+  "sql": [{{"table": "name", "op": "read|write", "quote": "<exact line>"}}],
+  "events": [{{"topic": "name", "op": "publish|consume", "quote": "<exact line>"}}],
+  "risks": [{{"description": "<concrete security problem in THIS code>", "severity": "high|medium|low",
+             "guidance": "<what generated code must do instead>", "quote": "<exact line>"}}]}}
+Rules: routes = HTTP/RPC endpoints this file SERVES (any framework, including hand-written dispatch).
+calls = requests this file SENDS to other services (not to third-party SaaS unless named).
+Write path parameters as {{name}}. Quotes must be copied verbatim from the file (one line is enough).
+Risks: only real issues visible in the code (missing authorization checks, trusting client input,
+injection, secrets, unsafe deserialization, data leaks), not style. Empty lists are fine."""
+
+CODE_EXT_LLM = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".java", ".kt", ".go", ".rs", ".rb",
+                ".php", ".cs", ".scala", ".ex", ".exs", ".dart", ".vue", ".svelte", ".swift"}
+
+
+def ready() -> bool:
+    if not llm.available():
+        print("LLM stages skipped: OPENROUTER_API_KEY not set (env or .env)")
+        return False
+    print(f"LLM stages (OpenRouter): extract={llm.EXTRACT_MODEL} reason={llm.REASON_MODEL}")
+    return True
+
+
+def _ask_json(system, user, model):
+    try:
+        return llm.chat_json(system, user, model, max_tokens=4000), None
+    except json.JSONDecodeError:
+        try:  # usually a truncated answer: retry with more room
+            return llm.chat_json(system, user, model, max_tokens=12000), None
+        except (llm.LLMError, json.JSONDecodeError) as e:
+            return None, str(e)
+    except llm.LLMError as e:
+        return None, str(e)
+
+
+def code_pass(ctx, workers: int = 8):
+    """LLM reads every code file: routes, outbound calls, SQL, events, risks - for any language."""
+    st = ctx.store
+    files = [s for s in ctx.sources.values()
+             if s.kind == "code" and s.text and 40 < len(s.text) < 120_000 and ctx.owner(s.path)
+             and "." + s.name.rsplit(".", 1)[-1].lower() in CODE_EXT_LLM]
+    model = f"llm:{llm.EXTRACT_MODEL}"
+
+    def one(src):
+        out, err = _ask_json(CODE_SYSTEM, f"File: {src.path}\n<file>\n{src.text}\n</file>", llm.EXTRACT_MODEL)
+        return src, out, err
+
+    counts = {"routes": 0, "calls": 0, "sql": 0, "events": 0, "risks": 0, "dropped": 0, "unresolved": 0}
+    with ThreadPoolExecutor(workers) as pool:
+        for src, out, err in pool.map(one, files):
+            if err:
+                print(f"  ! {src.path}: {err[:120]}")
+                continue
+            cid = ctx.owner(src.path)
+            status = ctx.status_for(src, cid)
+
+            def ev_for(item):
+                ln = locate_quote(src, str(item.get("quote", "")))
+                if not ln:
+                    counts["dropped"] += 1
+                    return None
+                return st.evidence(src.path, ln, src.lines[ln - 1], model), ln
+
+            for r in out.get("routes") or []:
+                hit = ev_for(r)
+                if hit and str(r.get("path", "")).startswith("/"):
+                    counts["routes"] += ctx.add_endpoint(cid, r.get("method") or "*", r["path"], "code", hit[0],
+                                                         status, 0.75, src.path)
+            for c in out.get("calls") or []:
+                hit = ev_for(c)
+                if not hit:
+                    continue
+                target = ctx.resolve(str(c.get("target") or ""))
+                if not target:
+                    counts["unresolved"] += 1  # no evidence which component it is: do not guess
+                    ctx.unresolved.append((src.path, str(c.get("target") or "")))
+                    continue
+                path = c.get("path") if str(c.get("path") or "").startswith("/") else None
+                ctx.add_call(cid, target, hit[0], status, 0.7, c.get("method") or "*", path)
+                counts["calls"] += 1
+            for q in out.get("sql") or []:
+                table = re.sub(r"\W", "", str(q.get("table", "")))
+                hit = ev_for(q)
+                if not hit or not table:
+                    continue
+                tid = st.component(f"table:{ctx.short(cid)}.{table}", "table", table, None, service=ctx.short(cid))
+                op = "READS" if q.get("op") == "read" else "WRITES"
+                if (cid, op, tid, hit[1], src.path) not in ctx.seen_rel:
+                    ctx.seen_rel.add((cid, op, tid, hit[1], src.path))
+                    st.relation(cid, op, tid, status, 0.7, hit[0])
+                    counts["sql"] += 1
+            for e in out.get("events") or []:
+                hit = ev_for(e)
+                if hit and e.get("topic"):
+                    topic = st.component(f"topic:{e['topic']}", "topic", str(e["topic"]))
+                    rel = "PUBLISHES_EVENT" if e.get("op") == "publish" else "CONSUMES_EVENT"
+                    st.relation(cid, rel, topic, status, 0.7, hit[0])
+                    counts["events"] += 1
+            for r in out.get("risks") or []:
+                hit = ev_for(r)
+                if not hit:
+                    continue
+                sev = r.get("severity") if r.get("severity") in {"high", "medium", "low"} else "medium"
+                st.risk("code-review-llm", sev, ctx.short(cid), str(r.get("description", ""))[:300],
+                        str(r.get("guidance") or "Do not repeat this pattern in generated code.")[:300],
+                        round(0.65 * (0.7 if src.archived else 1.0), 2), hit[0])
+                counts["risks"] += 1
+    print(f"  code: {len(files)} files -> " + ", ".join(f"{k} {v}" for k, v in counts.items()))
+
+
 # --------------------------------------------------------------------------- entry
 
 def catalog_text(ctx) -> str:
     rows = ctx.store.db.execute(
-        "SELECT id, path FROM component WHERE kind IN ('app','package','archived-project','table','team') ORDER BY id")
+        "SELECT id, path FROM component WHERE id LIKE 'comp:%' OR kind IN ('table','team') ORDER BY id")
     return "\n".join(f"- {cid}" + (f" ({p})" if p else "") for cid, p in rows)
 
 
 def enrich(ctx, repo, workers: int = 8):
-    if not llm.available():
-        print("stage 2 skipped: OPENROUTER_API_KEY not set")
-        return
-    print(f"stage 2 (OpenRouter): extract={llm.EXTRACT_MODEL} reason={llm.REASON_MODEL}")
     cat = catalog_text(ctx)
     extract_prose(ctx, cat, workers)
     read_diagrams(ctx, repo, cat, workers)
