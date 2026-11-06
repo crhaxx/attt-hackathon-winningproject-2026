@@ -34,9 +34,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import llm
+import policy
 
 # Bump when the model-stage code changes in a way that invalidates stored model results.
-MODEL_STAGE_VERSION = "1"
+MODEL_STAGE_VERSION = "3"  # 2: exact evidence lines; 3: no self-relations from prose (re-derived from cache)
 MALFORMED = (AttributeError, KeyError, TypeError, ValueError, sqlite3.IntegrityError)
 
 PROSE_KINDS = {"wiki", "doc", "adr", "runbook", "meeting_note", "incident", "issue",
@@ -65,9 +66,11 @@ def locate_quote(src, quote: str) -> int | None:
     if q not in _norm(src.text):
         return None
     head = q[:40]
-    for i, line in enumerate(src.lines):
-        window = _norm(" ".join(src.lines[i:i + 4]))
-        if window.startswith(head) or head in window:
+    for i, line in enumerate(src.lines):  # a quote on one line: that line
+        if head in _norm(line):
+            return i + 1
+    for i in range(len(src.lines)):  # a quote spanning lines: the line it starts on
+        if head in _norm(" ".join(src.lines[i:i + 4])) and head not in _norm(" ".join(src.lines[i + 1:i + 5])):
             return i + 1
     return 1
 
@@ -98,6 +101,10 @@ Return ONE JSON object:
                 "status": "accepted|proposed|superseded|rejected|unknown",
                 "rule": "<the normative statement engineers must follow, e.g. 'amounts are integer minor units'>",
                 "applies_to": ["<component id>"], "supersedes": "<title of the decision it replaces, or null>",
+                "check": null or {{"template": "require_mediation|permit_direct_call",
+                          "actor": ["<component id of the caller>"], "target": "<component id being called>",
+                          "via": "<component id that must sit in between; require_mediation only>",
+                          "operations": ["reads|writes|all|reads:<word>|writes:<word>|<METHOD> /path"]}},
                 "quote": "<exact sentence copied from the document>"}}]
 }}
 Rules: use the given component ids when the text refers to them (match by meaning, not only by name);
@@ -110,6 +117,10 @@ perspective = how THIS sentence presents the statement, not the document as a wh
 things are now), intended (a requirement, target or plan that is agreed but not necessarily done, e.g. "will
 use"), proposed (under discussion, not decided, e.g. "has not reached a launch date"), historical (how it used
 to be), reported (an observation from an incident, ticket or test). Use unknown when the sentence does not say.
+check: only for a decision about which component may call which other one directly (must go through an
+intermediary, or may call directly as an exception). operations must be as narrow as the text: "stock
+adjustments" -> "writes:adjust", "order reads" -> "reads:order"; use "all" only if the text says every
+operation, and leave the list empty if it does not say which. Otherwise check is null.
 aliases: only when the document itself makes clear which component the name refers to (e.g. "Edge, the API
 gateway"); never guess from a similar spelling. Facts and claims may use the alias's component id."""
 
@@ -190,14 +201,14 @@ def extract_prose(ctx, catalog: str, workers: int, docs) -> tuple[list[str], lis
     """Model extraction for the given documents; returns (succeeded, failed) paths."""
     st = ctx.store
     model = f"llm:{llm.EXTRACT_MODEL}"
-    kept = dropped = 0
+    kept = dropped = stated = 0
     ok, failed = [], []
     for src, out, err in _ordered(workers, lambda s: _extract_one(s, catalog), docs, lambda s: len(s.text or "")):
         if not err:
             st.use(f"llm:{src.path}")
             try:
-                k, d = _store_prose(ctx, src, out, model)
-                kept, dropped = kept + k, dropped + d
+                k, d, n = _store_prose(ctx, src, out, model)
+                kept, dropped, stated = kept + k, dropped + d, stated + n
                 ok.append(src.path)
                 continue
             except MALFORMED as e:  # malformed model output
@@ -206,15 +217,15 @@ def extract_prose(ctx, catalog: str, workers: int, docs) -> tuple[list[str], lis
                 ctx.doc_aliases = {}  # aliases are local to the document's own unit
         failed.append(src.path)
         print(f"  ! {src.path}: {err[:120]}")
-    n_dec = st.db.execute("SELECT COUNT(*) FROM component WHERE kind IN ('decision','policy','constraint')").fetchone()[0]
-    print(f"  prose: {len(docs)} docs, {kept} items kept ({n_dec} decisions/policies in the graph), "
+    # counted here: the component table only reflects this batch after the stage materializes it
+    print(f"  prose: {len(docs)} docs, {kept} items kept (incl. {stated} decision/policy statements), "
           f"{dropped} dropped (quote not found), {len(failed)} failed")
     return ok, failed
 
 
-def _store_prose(ctx, src, out, model) -> tuple[int, int]:
+def _store_prose(ctx, src, out, model) -> tuple[int, int, int]:
     st = ctx.store
-    kept = dropped = 0
+    kept = dropped = stated = 0
     status = out.get("doc_status")
     status = status if status in {"current", "historical", "proposal", "superseded"} else "unknown"
     date = out.get("effective_date") or src.doc_date
@@ -237,6 +248,12 @@ def _store_prose(ctx, src, out, model) -> tuple[int, int]:
             continue
         subj = _component(ctx, f.get("subject"))
         obj = _component(ctx, f.get("object"))
+        if obj == subj:  # e.g. "user-service SQLite file" resolved back to user-service by a name it contains
+            raw = str(f.get("object") or "").strip()
+            if raw.lower() in {subj.lower(), subj.split(":", 1)[-1].lower(), st._known[subj][1].lower()}:
+                dropped += 1  # the model named the subject twice: no relation
+                continue
+            obj = _concept(ctx, raw)
         ev = st.evidence(src.path, ln, f["quote"], model)
         conf = min(float(f.get("confidence") or 0.5), 0.7)  # prose never beats code
         persp = _perspective(f.get("perspective"), status)
@@ -279,13 +296,17 @@ def _store_prose(ctx, src, out, model) -> tuple[int, int]:
             st.component(did, dkind, str(d["title"])[:200], src.path, status=dstatus, rule=str(d["rule"])[:400],
                          date=date, supersedes=(str(d["supersedes"])[:200] if d.get("supersedes") else None))
         ev = st.evidence(src.path, ln, d["quote"], model)
-        # provenance as a relation (evidence ids are owned by this document's unit)
-        st.relation(did, "STATED_IN", f"source:{src.path}", "declared", 0.65, ev, decision_status=dstatus)
+        # provenance as a relation (evidence ids are owned by this document's unit); the call rule, if any,
+        # belongs to this statement of the decision, not to the decision node shared across documents
+        check = _policy_check(ctx, d.get("check"))
+        st.relation(did, "STATED_IN", f"source:{src.path}", "declared", 0.65, ev, decision_status=dstatus,
+                    **({"check": check} if check else {}))
         rel_st = "declared" if dstatus in {"accepted", "proposed", "unknown"} else "outdated"
         for target in d.get("applies_to") or []:
             st.relation(did, "GOVERNS", _component(ctx, target), rel_st, 0.65, ev, decision_status=dstatus, kind=dkind)
         kept += 1
-    return kept, dropped
+        stated += 1
+    return kept, dropped, stated
 
 
 def _perspective(value, doc_status: str) -> str:
@@ -325,6 +346,42 @@ def _store_aliases(ctx, src, out, model) -> tuple[int, int]:
     return kept, dropped
 
 
+def _policy_check(ctx, raw) -> dict | None:
+    """Validated call rule for policy.py. Parties must be known project components; anything that does not
+    resolve or parse is kept under `unresolved` (the evaluator then answers unknown instead of guessing)."""
+    if not isinstance(raw, dict) or raw.get("template") not in policy.TEMPLATES:
+        return None
+    unresolved = []
+
+    def party(ref, role):
+        if not ref:
+            return None
+        local = ctx.doc_aliases.get(str(ref).strip().lower()) if getattr(ctx, "doc_aliases", None) else None
+        cid = local or _known_component(ctx, ref)
+        if cid and cid.startswith("comp:"):
+            return ctx.store.keep(cid)
+        unresolved.append(f"{role} '{ref}'")
+        return None
+    actors = raw.get("actor") if isinstance(raw.get("actor"), list) else [raw.get("actor")]
+    actor_ids = [a for a in (party(a, "actor") for a in actors if a) if a]
+    target = party(raw.get("target"), "target")
+    via = party(raw.get("via"), "via") if raw["template"] == "require_mediation" else None
+    if raw["template"] == "require_mediation" and not raw.get("via"):
+        unresolved.append("via (missing)")
+    if not target and not raw.get("target"):
+        unresolved.append("target (missing)")
+    if not actor_ids and not any(actors):
+        unresolved.append("actor (missing)")
+    ops = []
+    for op in raw.get("operations") or []:
+        if policy.parse_operation(op):
+            ops.append(str(op).strip())
+        else:
+            unresolved.append(f"operation '{op}'")
+    return {"template": raw["template"], "actor": sorted(set(actor_ids)), "target": target, "via": via,
+            "operations": ops, "unresolved": unresolved}
+
+
 def _known_component(ctx, ref) -> str | None:
     ref = str(ref or "").strip()
     if not ref:
@@ -343,6 +400,10 @@ def _component(ctx, ref: str | None) -> str:
     for cand in (local, ref, "comp:" + ref.lower(), ctx.resolve(ref)):
         if cand and cand in st._known:
             return st.keep(cand)
+    return _concept(ctx, ref)
+
+
+def _concept(ctx, ref: str) -> str:
     slug = re.sub(r"[^a-z0-9.-]+", "-", ref.lower()).strip("-")[:60] or "unknown"
     return ctx.store.component(f"concept:{slug}", "concept", ref)
 

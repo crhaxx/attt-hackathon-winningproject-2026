@@ -167,6 +167,28 @@ Each PNG becomes a list of boxes and arrows mapped to known components. Plain co
 compares the arrows with the real call graph. It flags arrows that have no matching call,
 and calls the diagram leaves out. This is how an outdated architecture diagram is detected.
 
+### 7b. Policy checks (no AI)
+Some decisions say who may call whom: "clients reach Stock only through the gateway", or "the operations
+console may call Stock directly for stock adjustments". Step 6 extracts these as an optional `check` on the
+decision (template `require_mediation` or `permit_direct_call`, caller, callee, intermediary, and operations
+as narrow as the text: `writes:adjust`, `reads`, `GET /v1/products`). `policy.py` then checks every observed
+call the rules name and records one of six outcomes, with the deciding rules, the evidence and a reason:
+
+| outcome | meaning |
+|---|---|
+| `satisfied` | an in-force obligation has no direct call in its scope (and calls were extracted from the caller) |
+| `violated` | an in-force obligation covers the call and no exception does (also stored as a conflict) |
+| `permitted_by_exception` | an accepted permission covers this caller, callee and operation |
+| `unknown` | the evidence does not settle it: unknown decision status, unstated or unmatchable scope, an unresolved name, or an exception that may apply |
+| `not_applicable` | the rules exist but do not cover this operation, or are not in force (proposed, superseded, rejected) |
+| `conflicting_rules` | in-force rules disagree with no way to rank them (also stored as a conflict) |
+
+Only accepted decisions are in force; an unstated scope is unknown, never "everything"; an exception never
+extends to another caller or operation. Outcomes are recomputed whenever the knowledge changes, without model
+calls, and the verifier sees violations and conflicts as candidates. This explains a computation over the
+extracted rules; it does not prove the running system, and the rule's quote is shown so a reader can check
+how the document was read.
+
 ### 8. Verify (Sonnet)
 For each component, the model sees:
 - what the code does (observed facts, with evidence ids)
@@ -317,6 +339,9 @@ Called by `ingest.py`:
 - `read_diagrams()`: diagrams → nodes and edges, compared with the call graph
 - `verify()`: confirms or rejects candidates and reports new contradictions
 
+### `policy.py`: policy checks
+The deterministic evaluator of step 7b: who may call whom, per observed call, with six outcomes.
+
 ### `llm.py`: connection to OpenRouter
 Loads `OPENROUTER_API_KEY` from the environment or `.env` and sets the two models.
 `chat()` handles retries and the response cache. `chat_json()` parses JSON answers.
@@ -429,6 +454,7 @@ built from. So for any fact: evidence → file:line → blob id → commit.
 | `llm:code:<path>` | AI code pass for one file | its blob, model id or prompt changes, or the resolution context (components, aliases, ports, extraction signature) changes |
 | `llm:<path>` | prose and diagram extraction | its blob, model id, prompt text or the component catalog changes |
 | `llm:diagram-check` | diagram arrows vs observed call graph | knowledge changed (no model call: uses the stored diagram output) |
+| `llm:policy-check` | decisions' call rules vs observed calls (`policy.py`, six outcomes) | knowledge changed, or `policy.EVALUATOR_VERSION` changed (no model call) |
 | `llm:verify` | verifier verdicts + contradictions | anything it reviews changed |
 
 - Change detection is `git diff --name-status --no-renames <stored commit> HEAD` (renames are a
@@ -458,7 +484,8 @@ affected units. Missing credentials or failed model calls are reported, the mode
 contain model ids and prompt digests, never credentials.
 
 ### Migration and failure behaviour
-- The schema is versioned (`PRAGMA user_version` = 3; v2 -> v3 adds `claim.perspective` in place,
+- The schema is versioned (`PRAGMA user_version` = 4; v3 added `claim.perspective`, v4 the `assessment` table,
+  both in place,
   without re-extraction; the deterministic extraction signature is unaffected). Databases from before incremental ingest
   (with or without fingerprints and run history) are migrated in place and get one full logical
   refresh, in the same transaction; their run history is kept.

@@ -113,7 +113,7 @@ def status() -> str:
 
 @mcp.tool(structured_output=False)
 def context(name: str, focus: str = "", format: str = "text") -> str:
-    """Everything relevant about one component in one call, with evidence: implemented vs documented relationships, decisions/policies governing it, document claims (marked current/intended/proposed/historical/reported), conflicts and risks (with why they are linked), recorded gaps, and source passages. name is an id, a short name (inventory-service) or a name documents use for it (e.g. Stock). If the name is ambiguous, the candidates are returned. focus puts matching items first (never hides anything). format is text (default) or json."""
+    """Everything relevant about one component in one call, with evidence: implemented vs documented relationships, decisions/policies governing it, document claims (marked current/intended/proposed/historical/reported), conflicts and risks (with why they are linked), policy assessments of its calls (satisfied / violated / permitted_by_exception / unknown / not_applicable / conflicting_rules, each with the deciding rules), recorded gaps, and source passages. name is an id, a short name (inventory-service) or a name documents use for it (e.g. Stock). If the name is ambiguous, the candidates are returned. focus puts matching items first (never hides anything). format is text (default) or json."""
     return _call("context", {"name": name, "focus": focus, "format": "json" if format == "json" else "text",
                              "max_chars": MAX_OUTPUT - 500})
 
@@ -171,7 +171,7 @@ def read_source(path: str, start: int = 1, end: int = 0) -> str:
 
 @mcp.tool(structured_output=False)
 def sql(statement: str) -> str:
-    """Read-only SQL over context.db (80 rows max). Tables: source, component, relation, evidence, claim, conflict, risk, run, change, stage_state. Decisions/policies are rows in component (kind decision|policy|constraint) linked by GOVERNS relations."""
+    """Read-only SQL over context.db (80 rows max). Tables: source, component, relation, evidence, claim, conflict, risk, assessment, run, change, stage_state. Decisions/policies are rows in component (kind decision|policy|constraint) linked by GOVERNS relations."""
     return _call("sql", {"query": statement})
 
 

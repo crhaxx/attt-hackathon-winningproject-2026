@@ -43,7 +43,9 @@ def connect() -> sqlite3.Connection:
 
 def candidates(db, name: str) -> list[tuple[int, str, str]]:
     """(rank, component id, why it matches), best first. Rank: 0 exact id, 1 project/service name,
-    2 other component name, 3 alias stated in a document (KNOWN_AS, from model extraction)."""
+    2 another component's name (table, team, ...) or a name a document gives a component (KNOWN_AS alias),
+    3 a placeholder concept the model created for a name it could not map. Several ids in the best rank =
+    ambiguous. Within a rank, projects/services come first."""
     name = name.strip()
     found: dict[str, tuple[int, str]] = {}
 
@@ -53,12 +55,13 @@ def candidates(db, name: str) -> list[tuple[int, str, str]]:
     for (cid,) in db.execute("SELECT id FROM component WHERE id = ?", (name,)):
         add(0, cid, "id")
     for (cid,) in db.execute("SELECT id FROM component WHERE lower(name) = lower(?) OR id LIKE ?", (name, f"%:{name}")):
-        add(1 if cid.startswith("comp:") else 2, cid, "name")
+        add(1 if cid.startswith("comp:") else 3 if cid.startswith("concept:") else 2, cid, "name")
     for cid, path in db.execute(
             "SELECT DISTINCT src, substr(dst, 8) FROM relation WHERE type = 'KNOWN_AS' "
             "AND lower(json_extract(props, '$.alias')) = lower(?) ORDER BY src, dst", (name,)):
-        add(3, cid, f"called '{name}' in {path}")
-    return sorted(((r, cid, why) for cid, (r, why) in found.items()), key=lambda c: (c[0], len(c[1]), c[1]))
+        add(2, cid, f"called '{name}' in {path}")
+    return sorted(((r, cid, why) for cid, (r, why) in found.items()),
+                  key=lambda c: (c[0], not c[1].startswith("comp:"), len(c[1]), c[1]))
 
 
 def resolve(db, name: str) -> str:
@@ -453,6 +456,18 @@ def component_context(db, name: str, focus: str | None = None, max_items: int = 
                              "confidence": r["confidence"], "linked_by": why, "evidence": [r["evidence_id"]]})
     findings = _focus_first(findings, focus, lambda x: f"{x.get('check') or x.get('rule')} {x['description']}")
 
+    # policy assessments where it is the caller or the callee; problems first
+    rank = {"violated": 0, "conflicting_rules": 1, "unknown": 2, "permitted_by_exception": 3, "satisfied": 4,
+            "not_applicable": 5}
+    assessments = []
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name = 'assessment'").fetchone():
+        for r in db.execute("SELECT * FROM assessment WHERE actor = ? OR target = ? ORDER BY id", (cid, cid)):
+            assessments.append({"id": r["id"], "scope": r["scope"], "subject": r["subject"], "outcome": r["outcome"],
+                                "reason": r["reason"], "rules": json.loads(r["rules"]),
+                                "evidence": json.loads(r["evidence_ids"])})
+    assessments.sort(key=lambda a: (rank.get(a["outcome"], 9), a["id"]))
+    assessments = _focus_first(assessments, focus, lambda a: f"{a['subject']} {a['reason']}")
+
     aliases = [{"alias": json.loads(r["props"] or "{}").get("alias"), "evidence": [r["evidence_id"]]}
                for r in db.execute("SELECT props, evidence_id FROM relation WHERE src = ? AND type = 'KNOWN_AS' "
                                    "ORDER BY id", (cid,))]
@@ -469,6 +484,7 @@ def component_context(db, name: str, focus: str | None = None, max_items: int = 
         "decisions": cap("decisions", decisions_),
         "claims": cap("claims", claims),
         "findings": cap("findings", findings),
+        "policy_assessments": cap("policy_assessments", assessments),
         "mentioned_in": docs[:max_items * 2],
     }
     if len(docs) > max_items * 2:
@@ -572,6 +588,10 @@ def render_context(ctx: dict) -> str:
         else:
             L.append(f"  [RISK {f['severity']} {f['confidence']:.2f}] {f['rule']}: {f['description']}; do instead: "
                      f"{f['guidance']} {refs(f)}  (linked: {f['linked_by']})")
+    if ctx["policy_assessments"]:
+        L.append("POLICY ASSESSMENTS (call rules from decisions vs observed calls):")
+    for a in ctx["policy_assessments"]:
+        L.append(f"  [{a['outcome'].upper()}] {a['subject']}: {a['reason']} {refs(a)}")
     if ctx["mentioned_in"]:
         L.append("mentioned in: " + ", ".join(ctx["mentioned_in"]))
     if ctx["unknowns"]:

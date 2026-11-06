@@ -36,7 +36,9 @@ Answer format (markdown):
   that generated code must not repeat.
 - If the tools do not contain the answer, say so. Never cite a file you did not see in a tool result.
 - A document claim marked <intended> or <proposed> is a plan, not something that exists; <historical> is the past.
-  Never present them as implemented."""
+  Never present them as implemented.
+- Policy assessments: permitted_by_exception names the exception and its scope; never extend it to other callers
+  or operations. unknown means the evidence does not settle it - say so instead of guessing."""
 
 TOOLS = [
     ("search", "Full-text search over every file in the repository (FTS5 syntax).", {"text": "string"}),
@@ -61,7 +63,10 @@ TOOLS = [
             "evidence_ids,verdict,rationale,fingerprint), risk(rule,severity,subject,description,guidance,"
             "confidence,evidence_id,fingerprint), run(id,repo,commit_sha,finished,llm,conflicts,risks,new,resolved,"
             "baseline_run), change(run_id,item,change,fingerprint,summary,ref_id), stage_state(stage,commit_id,status,"
-            "detail) = which source commit the data represents and whether model enrichment is complete.",
+            "detail) = which source commit the data represents and whether model enrichment is complete, "
+            "assessment(scope,actor,target,subject,outcome,reason,rules,evidence_ids) = call rules from decisions "
+            "checked against observed calls; outcome satisfied|violated|permitted_by_exception|unknown|"
+            "not_applicable|conflicting_rules.",
             {"query": "string"}),
 ]
 REQUIRED = {"search": ["text"], "context": ["name"], "component": ["name"], "impact": ["name"], "read_source": ["path"], "sql": ["query"]}

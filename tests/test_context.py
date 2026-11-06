@@ -52,6 +52,12 @@ class ContextModel(FakeModel):
                                  "perspective": "intended", "quote": plan, "confidence": 0.6})
             out["claims"] += [{"component": "Gate", "topic": "ops", "claim": "payments behind Gate",
                                "perspective": "proposed", "quote": idea}]
+        if "Storage:" in doc:
+            line = next(l for l in lines if l.startswith("Storage:"))
+            out["facts"] += [{"subject": "order-service", "relation": "WRITES", "object": "order-service SQLite file",
+                              "quote": line, "confidence": 0.6},
+                             {"subject": "order-service", "relation": "AFFECTED_BY_INCIDENT", "object": "order-service",
+                              "quote": line, "confidence": 0.6}]
         if "Status: superseded" in doc:
             out["doc_status"] = "superseded"
             line = next(l for l in lines if "ledger" in l)
@@ -183,19 +189,64 @@ class ContextTest(Base):
         self.assertEqual(self.q("SELECT perspective FROM claim WHERE path = 'docs/old.md'"), [("historical",)],
                          "'current' inside a superseded document describes the past")
 
+    def test_prose_never_relates_a_component_to_itself(self):
+        self.write({"docs/storage.md": "# Storage\n\nStorage: order-service owns a SQLite file under .runtime/.\n"})
+        self.commit("storage doc")
+        self.ok()
+        self.assertFalse(self.q("SELECT type FROM relation WHERE src = dst"), "no self-relations")
+        self.assertEqual(self.q("SELECT dst FROM relation WHERE src = 'comp:order-service' AND type = 'WRITES' "
+                                "AND unit = 'llm:docs/storage.md'"), [("concept:order-service-sqlite-file",)])
+
     def test_schema_v2_upgrades_in_place(self):
         self.ok("--no-llm")
         with contextlib.closing(self.con()) as c:
             c.execute("ALTER TABLE claim DROP COLUMN perspective")
+            c.execute("DROP TABLE assessment")
             c.execute("PRAGMA user_version = 2")
             c.commit()
         out = self.ok("--no-llm")
-        self.assertIn("schema upgraded v2 -> v3", out)
+        self.assertIn(f"schema upgraded v2 -> v{ingest.SCHEMA_VERSION}", out)
+        self.assertIn("assessment", {r[0] for r in self.q("SELECT name FROM sqlite_master WHERE type = 'table'")})
         self.assertIn("0 files re-extracted", out)
         self.assertEqual(self.q("PRAGMA user_version"), [(ingest.SCHEMA_VERSION,)])
         self.assertIn("perspective", {r[1] for r in self.q("PRAGMA table_info(claim)")})
         self.assertEqual(ingest.integrity_problems(self.con()), [])
         self.assertIn("nothing to do", self.ok("--no-llm"))
+
+    def test_lookup_prefers_evidence_over_placeholders(self):
+        # shapes seen on the live corpus: the model left a placeholder concept "accounts" behind, and the
+        # orders table shares its name with the service the documents call "Orders"
+        db = sqlite3.connect(":memory:")
+        db.row_factory = sqlite3.Row
+        db.execute("CREATE TABLE component (id TEXT PRIMARY KEY, kind TEXT, name TEXT, path TEXT, props TEXT)")
+        db.execute("CREATE TABLE relation (id INTEGER PRIMARY KEY, src TEXT, type TEXT, dst TEXT, props TEXT)")
+        db.executemany("INSERT INTO component VALUES (?,?,?,?,NULL)", [
+            ("comp:user-service", "service", "user-service", "apps/user-service"),
+            ("comp:order-service", "service", "order-service", "apps/order-service"),
+            ("concept:accounts", "concept", "Accounts", None),
+            ("table:order-service.orders", "table", "orders", None)])
+        db.executemany("INSERT INTO relation (src, type, dst, props) VALUES (?, 'KNOWN_AS', ?, ?)", [
+            ("comp:user-service", "source:wiki/accounts.md", '{"alias": "Accounts"}'),
+            ("comp:order-service", "source:docs/adr/002.md", '{"alias": "Orders"}')])
+        self.assertEqual(query.resolve(db, "Accounts"), "comp:user-service", "an alias beats a placeholder concept")
+        self.assertEqual(query.resolve(db, "accounts"), "comp:user-service")
+        ctx = query.component_context(db, "Orders")
+        self.assertEqual({c["id"] for c in ctx["candidates"][:2]}, {"comp:order-service", "table:order-service.orders"})
+        self.assertEqual(ctx["ambiguous"], "Orders", "a table name and an alias tie: ask, do not guess")
+        self.assertEqual(query.resolve(db, "Orders"), "comp:order-service", "legacy tools pick the service")
+        self.assertEqual(query.resolve(db, "order-service"), "comp:order-service")
+        self.assertEqual(query.resolve(db, "concept:accounts"), "concept:accounts", "an exact id still wins")
+
+    def test_quote_is_located_on_its_own_line(self):
+        import enrich
+        src = mock.Mock(text=None, lines=["    setLoading(true);", "    try {",
+                                          "      const response = await fetch(`${inventory}/v1/products`);",
+                                          "      if (!response.ok)", "", "Orders are written", "in minor units."])
+        src.text = "\n".join(src.lines)
+        self.assertEqual(enrich.locate_quote(src, "const response = await fetch(`${inventory}/v1/products`);"), 3,
+                         "not the first line of a window that happens to contain it")
+        self.assertEqual(enrich.locate_quote(src, "Orders are written in minor units."), 6, "multi-line: where it starts")
+        self.assertIsNone(enrich.locate_quote(src, "this sentence is not in the file"))
 
     def test_names_component(self):
         yes = [("order-service", "order-service"), ("order-service.orders.total", "order-service"),

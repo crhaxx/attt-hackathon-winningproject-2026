@@ -98,6 +98,13 @@ Fields:
 - `rationale`
 - `fingerprint`: a stable identity across runs
 
+### `assessment`: a call checked against the decisions
+`scope (call | rule), actor, target, subject, outcome, reason, rules (decision ids), evidence_ids`.
+Outcome is one of `satisfied`, `violated`, `permitted_by_exception`, `unknown`, `not_applicable`,
+`conflicting_rules` (see WORKFLOW.md, step 7b). The rule itself is the `check` in a decision's `STATED_IN`
+relation props, so it belongs to the document that states it. Recomputed by `llm:policy-check`; `violated`
+and `conflicting_rules` are also `conflict` rows (`policy-violated`, `policy-conflict`).
+
 ### `risk`: a security concern
 Fields:
 - `rule`

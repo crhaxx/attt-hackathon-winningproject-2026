@@ -78,6 +78,8 @@ repo ─► classify ─► parse standard formats ─► AI reads code ─► c
 1. **Parsers** read what's certain: manifests, compose/Kubernetes, OpenAPI, CODEOWNERS, and the
    real DB schema, by replaying the migrations.
 2. **AI** reads what needs understanding: code in any language, prose, decisions, diagrams.
+   Decisions about who may call whom are then checked against the real calls, without AI: each call gets
+   *satisfied*, *violated*, *permitted by exception*, *unknown*, *not applicable* or *conflicting rules*.
 3. **Cross-checks** find contradictions, gaps and stale docs. An **AI verifier** confirms or rejects them.
 
 **Why you can trust it:**
@@ -124,6 +126,7 @@ python3 -m unittest discover -s tests                  # tests (mocked model, no
 | `query.py` | read-only queries shared by MCP, the CLI and `ask.py` |
 | `mcp/server.py` | MCP server for IDE agents |
 | `gitsnap.py` | read-only Git access for incremental ingest |
+| `policy.py` | checks decisions' call rules against observed calls (six outcomes, no AI) |
 | `llm.py` | OpenRouter client with a response cache |
 
 Browse the database with [DB Browser for SQLite](https://sqlitebrowser.org/): `sqlitebrowser context.db`.

@@ -54,6 +54,7 @@ except ImportError:  # pragma: no cover
 import enrich
 import gitsnap
 import llm
+import policy
 
 DEFAULT_REPO_URL = "https://github.com/arkik7/att-hackathon-task"
 HERE = Path(__file__).resolve().parent
@@ -61,7 +62,7 @@ HERE = Path(__file__).resolve().parent
 # Bump when extractor, check, rule or classification code changes: every deterministic
 # result is then re-extracted (and model results re-checked) even if HEAD did not move.
 EXTRACTION_VERSION = "2026-11-06.3"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # Storage layout the deterministic records assume. Part of the extraction signature; it stays at 2
 # because v3 only adds a model-stage column, so upgrading does not re-run any extraction.
 DET_SCHEMA = 2
@@ -226,10 +227,29 @@ MIGRATION_V3 = """
 ALTER TABLE claim ADD COLUMN perspective TEXT;
 """
 
+# Schema v4: policy assessments (policy.py). Derived from decisions + observed calls, recomputed with them.
+MIGRATION_V4 = """
+CREATE TABLE assessment (
+    id INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL,         -- call (one observed call) | rule (an obligation as a whole)
+    actor TEXT,
+    target TEXT,
+    subject TEXT NOT NULL,       -- the assessed observation, e.g. comp:admin -> comp:inventory-service POST /v1/...
+    outcome TEXT NOT NULL,       -- satisfied | violated | permitted_by_exception | unknown | not_applicable | conflicting_rules
+    reason TEXT NOT NULL,        -- which rules applied and why, in words
+    rules TEXT NOT NULL,         -- JSON list of decision/policy ids
+    evidence_ids TEXT NOT NULL,  -- JSON list: the call and the rules' statements
+    unit TEXT
+);
+CREATE INDEX assessment_unit ON assessment(unit);
+"""
+
 FTS_SCHEMA = "CREATE VIRTUAL TABLE source_fts USING fts5(path, kind, text)"
 
 DERIVED = "det:*"                    # cross-source deterministic results
 DIAGRAM_CHECK = "llm:diagram-check"  # diagram-vs-code comparison (deterministic, on model output)
+POLICY_CHECK = "llm:policy-check"    # decisions' call rules vs observed calls (deterministic, policy.py)
+POLICY_SIGNATURE = f"policy evaluator v{policy.EVALUATOR_VERSION}"
 VERIFY = "llm:verify"                # model verification verdicts and contradictions
 CODE_UNIT = "llm:code:"              # prefix of per-file LLM code-pass units
 
@@ -240,8 +260,9 @@ KEYS = {
     "conflict": ("kind", "check_name", "subject", "description", "base_confidence", "evidence_ids"),
     "claim": ("component", "topic", "text", "path", "doc_date", "doc_status", "evidence_id", "perspective"),
     "risk": ("rule", "severity", "subject", "description", "guidance", "confidence", "evidence_id"),
+    "assessment": ("scope", "actor", "target", "subject", "outcome", "reason", "rules", "evidence_ids"),
 }
-RECORD_TABLES = ("relation", "claim", "risk", "conflict", "evidence")  # delete order
+RECORD_TABLES = ("assessment", "relation", "claim", "risk", "conflict", "evidence")  # delete order
 
 
 class IngestError(RuntimeError):
@@ -277,7 +298,7 @@ def schema_state(db: sqlite3.Connection) -> str:
     tables = _tables(db)
     if version == SCHEMA_VERSION:
         return "current"
-    if version == 2:
+    if version in (2, 3):
         return "upgrade"
     if version > SCHEMA_VERSION:
         raise IngestError(f"database schema v{version} is newer than this ingest.py (v{SCHEMA_VERSION})")
@@ -292,7 +313,7 @@ def create_schema(db: sqlite3.Connection):
     for stmt in _statements(SCHEMA + RUN_SCHEMA):
         db.execute(stmt)
     _upgrade_v2(db)
-    upgrade_v3(db)
+    upgrade_schema(db)
 
 
 def migrate_legacy(db: sqlite3.Connection):
@@ -300,7 +321,7 @@ def migrate_legacy(db: sqlite3.Connection):
     removed and the caller performs a one-time full logical refresh inside the same transaction.
     Ingest history (run/change), when present, is kept."""
     _upgrade_v2(db)
-    upgrade_v3(db)
+    upgrade_schema(db)
     for table in RECORD_TABLES + ("component",):
         db.execute(f"DELETE FROM {table}")
     db.execute("DELETE FROM source")
@@ -325,10 +346,14 @@ def _upgrade_v2(db: sqlite3.Connection):
             pass  # no FTS5 in this SQLite build: query.py falls back to LIKE
 
 
-def upgrade_v3(db: sqlite3.Connection):
-    """v2 -> v3, in place: existing rows stay valid (their claims simply have no perspective)."""
-    for stmt in _statements(MIGRATION_V3):
-        db.execute(stmt)
+def upgrade_schema(db: sqlite3.Connection):
+    """v2 -> current, in place: existing rows stay valid (claims without perspective, no assessments yet)."""
+    if "perspective" not in _columns(db, "claim"):
+        for stmt in _statements(MIGRATION_V3):
+            db.execute(stmt)
+    if "assessment" not in _tables(db):
+        for stmt in _statements(MIGRATION_V4):
+            db.execute(stmt)
     db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -563,6 +588,10 @@ class Store:
     def risk(self, rule, severity, subject, description, guidance, confidence, ev):
         self._put("risk", (rule, severity, subject, description, guidance, confidence, ev))
 
+    def assessment(self, scope, actor, target, subject, outcome, reason, rules, evidence_ids):
+        self._put("assessment", (scope, actor, target, subject, outcome, reason, json.dumps(sorted(rules)),
+                                 json.dumps(sorted(set(evidence_ids)))))
+
     # -- sources -------------------------------------------------------------
     def set_text(self, path: str, kind: str, text: str | None):
         """source.text and its full-text index row, kept in step."""
@@ -584,6 +613,10 @@ def integrity_problems(db: sqlite3.Connection) -> list[str]:
         "risk without evidence": "SELECT COUNT(*) FROM risk WHERE evidence_id NOT IN (SELECT id FROM evidence)",
         "conflict citing missing evidence": "SELECT COUNT(*) FROM conflict c, json_each(c.evidence_ids) j "
                                             "WHERE j.value NOT IN (SELECT id FROM evidence)",
+        "assessment citing missing evidence": "SELECT COUNT(*) FROM assessment a, json_each(a.evidence_ids) j "
+                                              "WHERE j.value NOT IN (SELECT id FROM evidence)",
+        "assessment citing unknown rule": "SELECT COUNT(*) FROM assessment a, json_each(a.rules) j "
+                                          "WHERE j.value NOT IN (SELECT id FROM component)",
         "evidence for a file not in the snapshot": "SELECT COUNT(*) FROM evidence WHERE path NOT IN (SELECT path FROM source)",
         "relation from unknown component": "SELECT COUNT(*) FROM relation WHERE src NOT IN (SELECT id FROM component)",
         "relation to unknown component/source": "SELECT COUNT(*) FROM relation WHERE dst NOT IN (SELECT id FROM component) "
@@ -2408,6 +2441,12 @@ def families(s: Source) -> list[str]:
     return fams
 
 
+def model_signature() -> str:
+    """Model-stage configuration: model ids and prompt digests, plus the deterministic evaluators that run on
+    model output (so bumping policy.EVALUATOR_VERSION is picked up even when nothing else changed)."""
+    return json.dumps({**json.loads(enrich.model_signature()), "policy": POLICY_SIGNATURE}, sort_keys=True)
+
+
 def det_signature() -> str:
     return json.dumps({"extraction_version": EXTRACTION_VERSION, "schema": DET_SCHEMA,
                        "pyyaml": yaml is not None}, sort_keys=True)
@@ -2459,7 +2498,7 @@ class Ingestion:
     def run(self) -> int:
         db, snap = self.db, self.snap
         state = schema_state(db)
-        det_sig, model_sig = det_signature(), enrich.model_signature()
+        det_sig, model_sig = det_signature(), model_signature()
         want_model = not self.args.no_llm
         det_ok = False
         if state in ("current", "upgrade"):
@@ -2543,15 +2582,16 @@ class Ingestion:
                 migrate_legacy(db)
                 mode = f"legacy schema migrated to v{SCHEMA_VERSION} (one-time full refresh)"
             elif state == "upgrade":
-                upgrade_v3(db)
-                mode = f"schema upgraded v2 -> v{SCHEMA_VERSION} in place (no re-extraction)"
+                old_version = db.execute("PRAGMA user_version").fetchone()[0]
+                upgrade_schema(db)
+                mode = f"schema upgraded v{old_version} -> v{SCHEMA_VERSION} in place (no re-extraction)"
             det = self.stage("deterministic")
             prev = det["commit"] if det else None
             if det and det["signature"] != det_sig:
                 mode = f"extraction signature changed ({det['signature']} -> {det_sig}): every file re-extracted"
             st = Store(db)
             ctx = self.ctx = Ctx(st, {s.path: s for s in sources}, repo_name=self.repo_name, repo=snap.repo)
-            model_files = {u for u in self.units() if u.startswith("llm:") and u not in (DIAGRAM_CHECK, VERIFY)}
+            model_files = {u for u in self.units() if u.startswith("llm:") and u not in (DIAGRAM_CHECK, POLICY_CHECK, VERIFY)}
 
             # 1. which files changed (Git diff between the stored and the current commit)
             old = {r[0]: r[1:] for r in db.execute(
@@ -2617,7 +2657,8 @@ class Ingestion:
             self.invalidate_model(st)
             dropped = len(model_files - self.units().keys())
             mutated = st.mutations
-            if mutated or DIAGRAM_CHECK not in units:
+            if mutated or DIAGRAM_CHECK not in units or POLICY_CHECK not in units \
+                    or units[POLICY_CHECK].signature != POLICY_SIGNATURE:
                 self.check_diagrams(st)
             reset = bool(st.mutations) and (VERIFY in units or DIAGRAM_CHECK in units)
             if st.mutations:
@@ -2710,7 +2751,7 @@ class Ingestion:
         catalog = digest(enrich.catalog_text(self.ctx))
         want = self.model_units()
         for unit, row in self.units().items():
-            if not unit.startswith("llm:") or unit.startswith(CODE_UNIT) or unit in (DIAGRAM_CHECK, VERIFY):
+            if not unit.startswith("llm:") or unit.startswith(CODE_UNIT) or unit in (DIAGRAM_CHECK, POLICY_CHECK, VERIFY):
                 continue
             if unit not in want or row.blob != want[unit][0].blob or row.context != catalog:
                 st.drop(unit)
@@ -2727,6 +2768,10 @@ class Ingestion:
         enrich.check_diagrams(self.ctx)
         st.finish()
         st.mark(DIAGRAM_CHECK, "model", self.snap.head, "diagram edges vs observed relations")
+        st.use(POLICY_CHECK)  # after the diagram check: both feed the verifier as candidates
+        policy.evaluate(st)
+        st.finish()
+        st.mark(POLICY_CHECK, "model", self.snap.head, POLICY_SIGNATURE)
 
     def reset_verification(self, st: Store):
         st.drop(VERIFY)
@@ -2744,7 +2789,7 @@ class Ingestion:
             if (row is None or row.status != "complete" or row.blob != s.blob or row.signature != sigs[kind]
                     or row.context != context):
                 pending.append(u)
-        for u, sig in ((DIAGRAM_CHECK, None), (VERIFY, sigs["verify"])):
+        for u, sig in ((DIAGRAM_CHECK, None), (POLICY_CHECK, POLICY_SIGNATURE), (VERIFY, sigs["verify"])):
             row = units.get(u)
             if row is None or row.status != "complete" or (sig and row.signature != sig):
                 pending.append(u)
@@ -2753,11 +2798,11 @@ class Ingestion:
     def update_model_stage(self, failures: str | None = None):
         pending = self.model_pending()
         if not pending:
-            self.set_stage("model", "complete", enrich.model_signature())
+            self.set_stage("model", "complete", model_signature())
             return
-        files = sum(1 for u in pending if u not in (DIAGRAM_CHECK, VERIFY))
+        files = sum(1 for u in pending if u not in (DIAGRAM_CHECK, POLICY_CHECK, VERIFY))
         why = failures or ("not requested (--no-llm)" if self.args.no_llm else "not run")
-        self.set_stage("model", "incomplete", enrich.model_signature(),
+        self.set_stage("model", "incomplete", model_signature(),
                        f"{why}; pending: {files} files" + (", verification" if VERIFY in pending else ""))
 
     def model_phase(self) -> int:
@@ -2833,7 +2878,7 @@ class Ingestion:
 
             # C. diagram-vs-code comparison and verification
             changed = st.mutations
-            if changed or DIAGRAM_CHECK in pending:
+            if changed or DIAGRAM_CHECK in pending or POLICY_CHECK in pending:
                 self.check_diagrams(st)
             verify_failed = 0
             rerun = bool(changed) or VERIFY in pending
