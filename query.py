@@ -77,6 +77,20 @@ def cite(db, ev_id: int) -> str:
     return f'{loc}  "{e["quote"][:90]}"'
 
 
+def dependents(db, node: str, observed: bool = True) -> list[tuple[str, list]]:
+    """Components that depend on `node`, grouped by source: [(src, relations)].
+    observed=True: code/config evidence only (what really breaks). observed=False: edges that only
+    documents or diagrams claim (shown separately, never mixed into the impact chain)."""
+    marks = ",".join("?" * len(DEPENDENCY_EDGES))
+    cond = "status = 'observed'" if observed else f"status = 'declared' AND {NOT_PLANNED}"
+    rows = db.execute(f"SELECT * FROM relation WHERE dst = ? AND src != dst AND type IN ({marks}) AND {cond} "
+                      "ORDER BY confidence DESC, id", (node, *DEPENDENCY_EDGES)).fetchall()
+    by_src: dict[str, list] = {}
+    for r in rows:
+        by_src.setdefault(r["src"], []).append(r)
+    return list(by_src.items())
+
+
 def impact(db, name: str, limit: int = 6):
     """Summary first (owner, data, dependents), then the top decisions, conflicts and risks.
     Sections are capped at `limit` items, so the most important facts survive output limits."""
@@ -89,20 +103,13 @@ def impact(db, name: str, limit: int = 6):
     if tables:
         print("  Owns data:", ", ".join(t["dst"] for t in tables))
 
-    # dependents, hop by hop
+    # dependents, hop by hop (code/config evidence only; documented-only edges are listed separately)
     seen, frontier, depth, layers = {root}, [root], 0, []
-    marks = ",".join("?" * len(DEPENDENCY_EDGES))
     while frontier:
         depth += 1
         nxt, layer = [], []
         for node in frontier:
-            rows = db.execute(
-                f"SELECT * FROM relation WHERE dst = ? AND type IN ({marks}) AND status != 'outdated' "
-                f"AND {NOT_PLANNED} ORDER BY confidence DESC", (node, *DEPENDENCY_EDGES)).fetchall()
-            by_src: dict[str, list] = {}
-            for r in rows:
-                by_src.setdefault(r["src"], []).append(r)
-            for src, rels in by_src.items():
+            for src, rels in dependents(db, node):
                 if src in seen:
                     continue
                 seen.add(src)
@@ -125,6 +132,11 @@ def impact(db, name: str, limit: int = 6):
             print(f"      <- {cite(db, rels[0]['evidence_id'])}")
         for i, layer in enumerate(layers[1:], 2):
             print(f"  Hop {i}: " + ", ".join(f"{s} (via {n})" for s, n, _ in layer))
+    documented = [(s, rels) for s, rels in dependents(db, root, observed=False) if s not in seen]
+    if documented:
+        print("\n  Documented only (a doc or diagram claims it; no code/config evidence - may be stale or wrong):")
+        for src, rels in documented[:limit]:
+            print(f"  {src:<26} {rels[0]['type']}  [{rels[0]['confidence']}]  <- {cite(db, rels[0]['evidence_id'])}")
 
     if db.execute("SELECT 1 FROM relation WHERE dst = ? AND type = 'GOVERNS' LIMIT 1", (root,)).fetchone():
         decisions(db, root, header="\n  Decisions & policies that govern it:", limit=limit)

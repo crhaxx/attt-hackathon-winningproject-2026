@@ -61,7 +61,7 @@ HERE = Path(__file__).resolve().parent
 
 # Bump when extractor, check, rule or classification code changes: every deterministic
 # result is then re-extracted (and model results re-checked) even if HEAD did not move.
-EXTRACTION_VERSION = "2026-11-06.3"
+EXTRACTION_VERSION = "2026-11-06.4"
 SCHEMA_VERSION = 4
 # Storage layout the deterministic records assume. Part of the extraction signature; it stays at 2
 # because v3 only adds a model-stage column, so upgrading does not re-run any extraction.
@@ -1704,8 +1704,9 @@ def check_deploy_vs_code(ctx: Ctx):
         seen.add((caller, callee))
         if (caller, callee) not in declared:
             st.conflict("gap", "call-not-in-deploy-deps", f"{ctx.short(caller)} -> {ctx.short(callee)}",
-                        f"{ctx.short(caller)} calls {ctx.short(callee)} in code, but the deployment config does not "
-                        "declare that dependency (startup order and outage blast radius are invisible there)", 0.6, [ev])
+                        f"{ctx.short(caller)} calls {ctx.short(callee)} in code, but the deployment config has no "
+                        f"depends_on entry for it (an address variable alone does not declare startup order or "
+                        "outage blast radius)", 0.6, [ev])
 
 
 def check_schema_drift(ctx: Ctx):

@@ -62,7 +62,7 @@ What the agent gets back, for example from `risks("order-service")`:
 ```
 [HIGH 0.65] GET /v1/orders/:id never compares order.customer_id with the caller's identity (IDOR).
     do instead: verify order.customer_id === identity.customerId and return 404 otherwise.
-    <- apps/order-service/src/index.ts:41
+    <- apps/order-service/src/index.ts:44  .prepare("SELECT * FROM orders WHERE id = ?")
 ```
 
 **Tools:** `context` (start here: everything about one component, in one call) · `impact` · `component` · `conflicts` · `risks` · `decisions` · `changes` · `search` · `read_source` · `sql` · `status`

@@ -26,6 +26,7 @@ served from the llm.py response cache.
 """
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import re
@@ -63,16 +64,19 @@ def locate_quote(src, quote: str) -> int | None:
     q = _norm(quote)
     if len(q) < 8 or src.text is None:
         return None
-    if q not in _norm(src.text):
+    # the normalised lines joined by one space == _norm(whole text), with each line's start offset kept,
+    # so the result is the line where the quote STARTS (not the start of a window that contains it)
+    starts, parts, pos = [], [], 0
+    for i, line in enumerate(src.lines):
+        n = _norm(line)
+        if n:
+            starts.append(pos)
+            parts.append((i + 1, n))
+            pos += len(n) + 1
+    at = " ".join(n for _, n in parts).find(q)
+    if at < 0:
         return None
-    head = q[:40]
-    for i, line in enumerate(src.lines):  # a quote on one line: that line
-        if head in _norm(line):
-            return i + 1
-    for i in range(len(src.lines)):  # a quote spanning lines: the line it starts on
-        if head in _norm(" ".join(src.lines[i:i + 4])) and head not in _norm(" ".join(src.lines[i + 1:i + 5])):
-            return i + 1
-    return 1
+    return parts[bisect.bisect_right(starts, at) - 1][0]
 
 
 # --------------------------------------------------------------------------- A. prose
@@ -122,7 +126,11 @@ intermediary, or may call directly as an exception). operations must be as narro
 adjustments" -> "writes:adjust", "order reads" -> "reads:order"; use "all" only if the text says every
 operation, and leave the list empty if it does not say which. Otherwise check is null.
 aliases: only when the document itself makes clear which component the name refers to (e.g. "Edge, the API
-gateway"); never guess from a similar spelling. Facts and claims may use the alias's component id."""
+gateway"); never guess from a similar spelling. Facts and claims may use the alias's component id.
+Never report a fact the sentence DENIES or only QUESTIONS (e.g. "X is not a payment adapter", "has no runtime
+dependency on Y", "is a question, not an approved reuse"): no relation exists then.
+risks = security, data-correctness or availability risks for the SOFTWARE only; ignore office logistics,
+meeting organisation and similar. A decision is "superseded" only if the document says it was replaced."""
 
 DECISION_KINDS = {"decision", "policy", "constraint"}
 DECISION_STATUS = {"accepted", "proposed", "superseded", "rejected", "unknown"}
@@ -269,11 +277,13 @@ def _store_prose(ctx, src, out, model) -> tuple[int, int, int]:
         st.claim(_component(ctx, c.get("component")), c.get("topic"), c.get("claim"), src.path, date, status, ev,
                  _perspective(c.get("perspective"), status))
         kept += 1
+    risk_quotes = set()
     for r in out.get("risks", []):
         ln = locate_quote(src, r.get("quote", ""))
-        if not ln:
+        if not ln or _norm(r["quote"]) in risk_quotes:  # one risk per sentence
             dropped += 1
             continue
+        risk_quotes.add(_norm(r["quote"]))
         ev = st.evidence(src.path, ln, r["quote"], model)
         sev = r.get("severity") if r.get("severity") in {"high", "medium", "low"} else "medium"
         st.risk("doc-reported-risk", sev, src.path, r.get("description", "")[:300],
@@ -286,8 +296,10 @@ def _store_prose(ctx, src, out, model) -> tuple[int, int, int]:
             continue
         dkind = d.get("kind") if d.get("kind") in DECISION_KINDS else "decision"
         dstatus = d.get("status") if d.get("status") in DECISION_STATUS else "unknown"
-        if status in {"historical", "superseded"} and dstatus == "accepted":
-            dstatus = "superseded"  # an accepted decision inside a superseded document is no longer in force
+        if src.archived and dstatus == "accepted":
+            # an archive/history copy no longer governs anything. A merely *historical* document (a closed
+            # issue, an incident) keeps the model's status: its accepted decision may well be implemented.
+            dstatus = "superseded"
         did = f"{dkind}:{_slug(d['title'])}"
         # the first document that states a decision declares it; later ones only reference it
         if did in st._known:
@@ -469,8 +481,10 @@ def _store_diagram(ctx, src, out, model):
     for e in out.get("edges", []):
         a, b = mapping.get(e.get("from")), mapping.get(e.get("to"))
         quote = f"diagram edge: {e.get('from')} -> {e.get('to')} {e.get('label') or ''}".strip()
-        ev = st.evidence(src.path, None, quote, model)
         a_id, b_id = _component(ctx, a or e.get("from")), _component(ctx, b or e.get("to"))
+        if a_id == b_id:  # two boxes mapped to one component: not a connection
+            continue
+        ev = st.evidence(src.path, None, quote, model)
         st.relation(a_id, "DIAGRAM_EDGE", b_id, "declared", 0.6, ev, label=e.get("label"))
         edges.append([a_id, b_id, ev])
     # input of the diagram-vs-code comparison, which is recomputed whenever the code graph changes
@@ -524,106 +538,155 @@ Return ONE JSON object:
 Candidates can be gaps (missing owner, missing config, missing docs): confirm a gap when the
 evidence shows the thing is absent where it should be; that is not a code-vs-doc disagreement.
 Rules: only cite ids you were given. A claim that matches the code is NOT a contradiction.
+Review EVERY candidate in candidate_reviews; never report a candidate again under contradictions
+(also not one you rejected). contradictions are only NEW problems the candidates do not cover.
 Two documents disagreeing is a contradiction even if the code is silent; say which is newer.
 Code that breaks an ACCEPTED decision or policy is a conflict; a proposed one is only intent.
 Do not invent connections: the same API name in two unrelated projects is not a relationship
 unless the evidence says so. Return empty lists if nothing is wrong."""
 
 
+def _cand_owner(subject: str, names) -> str | None:
+    """The one component a candidate conflict belongs to: the earliest (then longest) component name
+    in its subject, matched as a whole name. Each candidate is reviewed by exactly one verify job."""
+    best = None
+    for cid, short in names:
+        m = re.search(rf"(?<![\w-]){re.escape(short)}(?![\w-])", subject or "")
+        if m and (best is None or (m.start(), -len(short)) < best[0]):
+            best = ((m.start(), -len(short)), cid)
+    return best[1] if best else None
+
+
+GOVERNING_BUDGET = 4500  # chars of decision lines per verify prompt; the rest is counted, never silently cut
+_STATUS_RANK = {"accepted": 0, "unknown": 1, "proposed": 2, "superseded": 3, "rejected": 4}
+
+
 def verify(ctx, workers: int) -> int:
-    """Review candidates per component; returns the number of failed jobs. Writes go to the active unit."""
+    """Review candidates per component; returns the number of failed jobs. Writes go to the active unit.
+
+    Prompts are built from row CONTENT, in content order, with local labels (E1.., C1..) mapped back to
+    database ids after the answer. A prompt therefore only changes when the knowledge about that
+    component changes, not when unrelated rows are renumbered, so unchanged jobs replay from the cache."""
     st, db = ctx.store, ctx.store.db
-    comps = [r[0] for r in db.execute(
+    names = [(r[0], r[0].split(":", 1)[1]) for r in db.execute(
+        "SELECT id FROM component WHERE id LIKE 'comp:%' OR id LIKE 'table:%' ORDER BY id")]
+    owner_of: dict[str, list] = {}
+    for row in db.execute("SELECT id, subject, description, evidence_ids FROM conflict WHERE verdict IS NULL"):
+        owner = _cand_owner(row[1], names)
+        if owner:
+            owner_of.setdefault(owner, []).append(row)
+    comps = sorted({r[0] for r in db.execute(
         "SELECT DISTINCT component FROM claim WHERE component LIKE 'comp:%' OR component LIKE 'table:%' "
-        "UNION SELECT DISTINCT dst FROM relation WHERE type = 'GOVERNS' AND dst LIKE 'comp:%'")]
+        "UNION SELECT DISTINCT dst FROM relation WHERE type = 'GOVERNS' AND dst LIKE 'comp:%'")} | set(owner_of))
     jobs = []
     for cid in comps:
         short = cid.split(":", 1)[1]
-        obs = db.execute(
-            "SELECT r.type, r.dst, r.src, r.props, r.evidence_id, e.path, e.line, e.quote FROM relation r "
-            "JOIN evidence e ON e.id = r.evidence_id WHERE (r.src = ? OR r.dst = ?) AND r.status = 'observed' "
-            "AND r.type != 'MENTIONED_IN' ORDER BY r.id LIMIT 80", (cid, cid)).fetchall()
+        obs = sorted(db.execute(
+            "SELECT r.type, r.src, r.dst, IFNULL(r.props, ''), e.path, IFNULL(e.line, 0), e.quote, r.evidence_id "
+            "FROM relation r JOIN evidence e ON e.id = r.evidence_id WHERE (r.src = ? OR r.dst = ?) "
+            "AND r.status = 'observed' AND r.type != 'MENTIONED_IN'", (cid, cid)).fetchall())[:80]
         tables = db.execute("SELECT id, props FROM component WHERE kind='table' AND props LIKE ? ORDER BY id",
                             (f'%"service": "{short}"%',)).fetchall()
-        claims = db.execute(
-            "SELECT c.text, c.path, c.doc_date, c.doc_status || IFNULL('/' || c.perspective, ''), c.evidence_id, "
-            "e.quote FROM claim c "
-            "JOIN evidence e ON e.id = c.evidence_id WHERE c.component = ? ORDER BY c.id LIMIT 60", (cid,)).fetchall()
-        cands = db.execute("SELECT id, description, evidence_ids FROM conflict WHERE subject LIKE ? "
-                           "AND verdict IS NULL ORDER BY id", (f"%{short}%",)).fetchall()
+        claims = sorted(db.execute(
+            "SELECT c.path, c.text, IFNULL(c.doc_date, ''), c.doc_status || IFNULL('/' || c.perspective, ''), "
+            "e.quote, c.evidence_id FROM claim c JOIN evidence e ON e.id = c.evidence_id WHERE c.component = ?",
+            (cid,)).fetchall())[:60]
         governing = db.execute(
-            "SELECT c.kind, c.name, c.path, c.props, r.evidence_id, e.quote FROM relation r "
+            "SELECT c.kind, c.name, c.path, c.props, e.quote, r.evidence_id FROM relation r "
             "JOIN component c ON c.id = r.src JOIN evidence e ON e.id = r.evidence_id "
-            "WHERE r.dst = ? AND r.type = 'GOVERNS' ORDER BY r.id LIMIT 20", (cid,)).fetchall()
+            "WHERE r.dst = ? AND r.type = 'GOVERNS'", (cid,)).fetchall()
+        governing = sorted(governing, key=lambda g: (_STATUS_RANK.get(json.loads(g[3] or "{}").get("status"), 9),
+                                                     g[0], g[1], g[2] or "", g[4]))
+        cands = sorted(owner_of.get(cid, []), key=lambda c: (c[2], c[1]))
         if not claims and not cands and not governing:
             continue
+        labels: dict[int, str] = {}
+        lab = lambda ev: labels.setdefault(ev, f"E{len(labels) + 1}")  # noqa: E731
         lines = [f"COMPONENT {cid}", "OBSERVED:"]
-        ids = set()
-        for t, dst, src_, props, ev, path, ln, quote in obs:
-            ids.add(ev)
-            lines.append(f"  E{ev} {src_} {t} {dst} {props or ''} | {path}:{ln} \"{quote[:120]}\"")
+        for t, src_, dst, props, path, ln, quote, ev in obs:
+            lines.append(f"  {lab(ev)} {src_} {t} {dst} {props} | {path}:{ln or '-'} \"{quote[:120]}\"")
         for tid, props in tables:
             lines.append(f"  (live schema) {tid} {props}")
         lines.append("DOCUMENTED:")
-        for text, path, date, status, ev, quote in claims:
-            ids.add(ev)
-            lines.append(f"  E{ev} [{path}, {date or 'undated'}, {status}] {text} | \"{quote[:160]}\"")
+        for path, text, date, status, quote, ev in claims:
+            lines.append(f"  {lab(ev)} [{path}, {date or 'undated'}, {status}] {text} | \"{quote[:160]}\"")
         if governing:
             lines.append("DECISIONS / POLICIES governing it (check whether the code follows them):")
-            for kind, name, path, props, ev, quote in governing:
-                ids.add(ev)
+            used = 0
+            for i, (kind, name, path, props, quote, ev) in enumerate(governing):
                 p = json.loads(props or "{}")
-                lines.append(f"  E{ev} [{kind}, {p.get('status')}, {path}, {p.get('date') or 'undated'}] {name}: "
-                             f"{p.get('rule')} | \"{quote[:140]}\"")
+                line = (f"  {lab(ev)} [{kind}, {p.get('status')}, {path}, {p.get('date') or 'undated'}] {name}: "
+                        f"{p.get('rule')} | \"{quote[:140]}\"")
+                if used + len(line) > GOVERNING_BUDGET:
+                    lines.append(f"  ... {len(governing) - i} more (lower status rank) not shown")
+                    break
+                used += len(line)
+                lines.append(line)
         lines.append("CANDIDATES:")
-        cand_ids = set()
-        for cid_, desc, evs in cands:
-            cand_ids.add(cid_)
-            ids.update(json.loads(evs))
-            lines.append(f"  C{cid_} {desc}")
-            for e in json.loads(evs):
-                path, ln, quote, ex = db.execute("SELECT path, line, quote, extractor FROM evidence WHERE id = ?", (e,)).fetchone()
-                lines.append(f"      E{e} {path}:{ln or '-'} [{ex}] \"{quote[:160]}\"")
-        jobs.append((cid, "\n".join(lines), ids, cand_ids))
+        cand_map: dict[str, int] = {}
+        cand_evs: dict[int, set] = {}
+        for i, (gid, _subject, desc, evs) in enumerate(cands, 1):
+            cand_map[f"C{i}"] = gid
+            evl = json.loads(evs)
+            cand_evs[gid] = set(evl)
+            lines.append(f"  C{i} {desc}")
+            rows = sorted(db.execute(f"SELECT path, IFNULL(line, 0), quote, extractor, id FROM evidence "
+                                     f"WHERE id IN ({','.join('?' * len(evl))})", evl).fetchall()) if evl else []
+            for path, ln, quote, ex, e in rows:
+                lines.append(f"      {lab(e)} {path}:{ln or '-'} [{ex}] \"{quote[:160]}\"")
+        back = {v: k for k, v in labels.items()}  # "E3" -> evidence id
+        jobs.append((cid, "\n".join(lines), back, cand_map, cand_evs))
 
     def one(job):
-        out, err = _ask_json(VERIFY_SYSTEM, job[1], llm.REASON_MODEL, retry_tokens=None)
+        out, err = _ask_json(VERIFY_SYSTEM, job[1], llm.REASON_MODEL, max_tokens=8000, retry_tokens=None)
+        if err:  # reasoning models occasionally run away on a large prompt; a second attempt usually works
+            out, err = _ask_json(VERIFY_SYSTEM, job[1], llm.REASON_MODEL, max_tokens=8000, retry_tokens=None)
         return job, out, err
 
-    confirmed = rejected = new = failed = 0
-    if True:  # (indentation kept from the former pool block)
-        for (cid, _, ids, cand_ids), out, err in _ordered(workers, one, jobs, lambda j: len(j[1])):
-            if err:
-                failed += 1
-                print(f"  ! verify {cid}: {err[:120]}")
+    def local_ids(value, back):
+        return [back[f"E{n}"] for n in re.findall(r"E?(\d+)", " ".join(map(str, value if isinstance(value, list)
+                                                                              else [value]))) if f"E{n}" in back]
+
+    confirmed = rejected = new = restated = failed = 0
+    for (cid, _, back, cand_map, cand_evs), out, err in _ordered(workers, one, jobs, lambda j: len(j[1])):
+        if err:
+            failed += 1
+            print(f"  ! verify {cid}: {err[:120]}")
+            continue
+        for rv in out.get("candidate_reviews", []):
+            m = re.match(r"C?(\d+)", str(rv.get("conflict_id", "")))
+            gid = cand_map.get(f"C{m.group(1)}") if m else None
+            if gid is None or rv.get("verdict") not in {"confirmed", "rejected"}:
                 continue
-            for rv in out.get("candidate_reviews", []):
-                m = re.match(r"C?(\d+)", str(rv.get("conflict_id", "")))
-                if not m or int(m.group(1)) not in cand_ids or rv.get("verdict") not in {"confirmed", "rejected"}:
-                    continue
-                factor = 1.3 if rv["verdict"] == "confirmed" else 0.3
-                db.execute("UPDATE conflict SET verdict = ?, rationale = ?, "
-                           "confidence = MIN(0.95, ROUND(base_confidence * ?, 2)) WHERE id = ?",
-                           (rv["verdict"], rv.get("rationale"), factor, int(m.group(1))))
-                confirmed += rv["verdict"] == "confirmed"
-                rejected += rv["verdict"] == "rejected"
-            for c in out.get("contradictions", []):
-                evs = [int(x) for x in re.findall(r"\d+", " ".join(map(str, c.get("evidence_ids", []))))]
-                evs = [e for e in evs if e in ids]
-                if not evs:
-                    continue
-                cur = re.findall(r"\d+", str(c.get("current_evidence_id", "")))
-                note = f" Current source: E{cur[0]} ({c.get('why_current')})" if cur and int(cur[0]) in ids else ""
-                kind = c.get("kind") if c.get("kind") in {"conflict", "stale", "gap"} else "conflict"
-                try:
-                    conf = round(min(float(c.get("confidence") or 0.6), 0.85), 2)
-                except (TypeError, ValueError):
-                    conf = 0.6
-                st.conflict(kind, "llm-contradiction", cid, (c.get("description") or "")[:600] + note,
-                            conf, evs, verdict="llm-found")
-                new += 1
+            factor = 1.3 if rv["verdict"] == "confirmed" else 0.3
+            db.execute("UPDATE conflict SET verdict = ?, rationale = ?, "
+                       "confidence = MIN(0.95, ROUND(base_confidence * ?, 2)) WHERE id = ?",
+                       (rv["verdict"], rv.get("rationale"), factor, gid))
+            confirmed += rv["verdict"] == "confirmed"
+            rejected += rv["verdict"] == "rejected"
+        for c in out.get("contradictions", []):
+            evs = local_ids(c.get("evidence_ids", []), back)
+            if not evs:
+                continue
+            # a contradiction that mostly re-uses a candidate's evidence restates (or re-raises) that candidate
+            if any(len(set(evs) & ce) * 2 >= len(set(evs)) for ce in cand_evs.values() if ce):
+                restated += 1
+                continue
+            cur = local_ids(c.get("current_evidence_id", ""), back)[:1]
+            note = ""
+            if cur:
+                path, ln = db.execute("SELECT path, line FROM evidence WHERE id = ?", (cur[0],)).fetchone()
+                note = f" Current source: {path}:{ln or '-'} ({c.get('why_current')})"
+            kind = c.get("kind") if c.get("kind") in {"conflict", "stale", "gap"} else "conflict"
+            try:
+                conf = round(min(float(c.get("confidence") or 0.6), 0.85), 2)
+            except (TypeError, ValueError):
+                conf = 0.6
+            st.conflict(kind, "llm-contradiction", cid, (c.get("description") or "")[:600] + note,
+                        conf, evs, verdict="llm-found")
+            new += 1
     print(f"  verify: {len(jobs)} components, candidates confirmed {confirmed} / rejected {rejected}, "
-          f"{new} new contradictions, {failed} failed")
+          f"{new} new contradictions ({restated} restating a candidate dropped), {failed} failed")
     return failed
 
 

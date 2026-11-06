@@ -348,9 +348,12 @@ def _(db):
 
 
 # ------------------------------------------------------------ MUST NOT DETECT / MUST NOT LINK
-@check("N01", "not", "issues/ACC-42.md is not an active stale finding (it describes the rename)")
+@check("N01", "not", "issues/ACC-42.md itself is not called stale (it describes the rename)")
 def _(db):
-    rs = conflicts(db, path="issues/ACC-42.md", kind="stale")
+    # citing ACC-42 as evidence of the CURRENT state is correct; flagging ACC-42 as the stale source is not
+    rs = [r for r in conflicts(db, path="issues/ACC-42.md", kind="stale")
+          if r["check_name"] != "llm-contradiction"
+          or re.match(r"\W*(issues/)?ACC-42\b", r["description"], re.I)]
     return not rs, [r["id"] for r in rs]
 
 
